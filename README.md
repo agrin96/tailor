@@ -75,9 +75,12 @@ tailor src tests                  # format the files in place
 tailor --check src                # list the files that change, write nothing
 tailor --diff src                 # show the changes as a diff, write nothing
 tailor --line-length 100 src      # replace the line length from pyproject.toml
+tailor --version                  # show the installed version
 ```
 
-With `--check` or `--diff`, the exit code is 1 if a file changes. tailor formats the files in parallel. It skips hidden folders and `__pycache__`.
+With `--check` or `--diff`, the exit code is 1 if a file changes. On a terminal, `--diff` shows removed lines in red and added lines in green. Output to a pipe or a file, or with the `NO_COLOR` environment variable set, has no color. tailor formats the files in parallel.
+
+tailor formats the `.py` files that `ruff check` finds in the given paths. Ruff's default exclusions (for example `.venv`, `venv`, `build`, `dist`, and `node_modules`), the `exclude` and `extend-exclude` settings of `[tool.ruff]`, and `.gitignore` apply. A file that you name directly is formatted also when it is excluded, unless `[tool.ruff]` sets `force-exclude = true`. This is the same as `ruff format`. The `exclude` settings of `[tool.ruff.lint]` and `[tool.ruff.format]` do not apply to this list.
 
 ### Format on save in Neovim
 

@@ -54,5 +54,15 @@ LOOSER_THAN_CONDITIONAL = (",", ":=", "lambda", "yield")
 DEFINITIONS = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 LOOPS_AND_BRANCHES = ast.For | ast.AsyncFor | ast.While | ast.If
 
+# click.style arguments per diff line; the first match wins, so the file headers come
+# before the single + and -
+DIFF_LINE_STYLES = (
+    ("+++", {"bold": True}),
+    ("---", {"bold": True}),
+    ("@@", {"fg": "cyan"}),
+    ("+", {"fg": "green"}),
+    ("-", {"fg": "red"}),
+)
+
 # options that must be at least 1; every other number may be 0
 POSITIVE_OPTIONS = ("line_length", "assignment_group_size")

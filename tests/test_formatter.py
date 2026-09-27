@@ -2,11 +2,12 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from tailor.imports import sort_imports
 from tailor.config import Settings, load_settings
 from tailor.operators import remove_split_markers
-from tailor import Mode, format_file, python_files, format_source
+from tailor import Mode, main, format_file, colored_diff, python_files, format_source
 
 FIRST_PARTY = frozenset({"jobs", "worker"})
 
@@ -167,7 +168,6 @@ def test_overlapping_arguments_list_each_file_once(tmp_path, monkeypatch):
     (tmp_path / "package").mkdir()
     (tmp_path / "package" / "module.py").write_text("value = 1\n")
     monkeypatch.chdir(tmp_path)
-
     files = python_files(
         paths = [
             Path("package"),
@@ -175,8 +175,26 @@ def test_overlapping_arguments_list_each_file_once(tmp_path, monkeypatch):
             tmp_path / "package" / "module.py",
         ]
     )
-
     assert files == [Path("package/module.py")]
+
+
+def test_files_come_from_ruff_discovery(tmp_path, monkeypatch):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.ruff]\nextend-exclude = ["generated"]\n',
+    )
+
+    for name in [
+        "package/module.py",
+        "package/stub.pyi",
+        ".venv/lib.py",
+        "venv/lib.py",
+        "generated/code.py",
+    ]:
+        (tmp_path / name).parent.mkdir(parents = True, exist_ok = True)
+        (tmp_path / name).write_text("value = 1\n")
+    monkeypatch.chdir(tmp_path)
+    assert python_files(paths = [Path(".")]) == [Path("package/module.py")]
+    assert python_files(paths = [Path("venv/lib.py")]) == [Path("venv/lib.py")]
 
 
 def test_wrapped_boolean_expression_puts_each_operand_on_its_own_line():
@@ -693,4 +711,57 @@ def test_config_section_that_is_not_a_table_is_a_file_error(tmp_path):
     result = format_file(path = module, mode = Mode.CHECK, line_length = None)
     assert (
         result.error == f"{tmp_path / 'pyproject.toml'}: [tool.tailor] must be a table"
+    )
+
+
+def test_force_exclude_also_skips_a_file_named_directly(tmp_path, monkeypatch):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.ruff]\nforce-exclude = true\nextend-exclude = ["generated"]\n',
+    )
+    (tmp_path / "generated").mkdir()
+    (tmp_path / "generated" / "code.py").write_text("value = 1\n")
+    monkeypatch.chdir(tmp_path)
+    assert python_files(paths = [Path("generated/code.py")]) == []
+
+
+def test_a_folder_and_a_symlink_to_it_list_each_file_once(tmp_path, monkeypatch):
+    (tmp_path / "package").mkdir()
+    (tmp_path / "package" / "module.py").write_text("value = 1\n")
+    (tmp_path / "alias").symlink_to(tmp_path / "package", target_is_directory = True)
+    monkeypatch.chdir(tmp_path)
+    assert len(python_files(paths = [Path("package"), Path("alias")])) == 1
+
+
+def test_colored_diff_colors_lines_by_their_prefix():
+    diff = "--- a.py\n+++ a.py\n@@ -1 +1 @@\n-value=1\n+value = 1\n unchanged\n"
+    assert colored_diff(diff = diff) == (
+        "\033[1m--- a.py\033[0m\n"
+        "\033[1m+++ a.py\033[0m\n"
+        "\033[36m@@ -1 +1 @@\033[0m\n"
+        "\033[31m-value=1\033[0m\n"
+        "\033[32m+value = 1\033[0m\n"
+        " unchanged\n"
+    )
+
+
+def test_command_line_rejects_a_missing_path_and_check_with_diff(tmp_path, monkeypatch):
+    (tmp_path / "module.py").write_text("value = 1\n")
+    monkeypatch.chdir(tmp_path)
+    missing = CliRunner().invoke(main, ["missing.py"])
+    assert missing.exit_code == 2 and "'missing.py' does not exist" in missing.output
+    both = CliRunner().invoke(main, ["--check", "--diff", "module.py"])
+    assert (
+        both.exit_code == 2
+        and "--check and --diff cannot be used together" in both.output
+    )
+
+
+def test_redirected_diff_keeps_escape_characters_from_the_source(tmp_path, monkeypatch):
+    (tmp_path / "module.py").write_text("value=1  # \x1b[31mred\x1b[0m\n")
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["--diff", "module.py"])
+    assert result.exit_code == 1
+    assert (
+        "-value=1  # \x1b[31mred\x1b[0m\n+value = 1  # \x1b[31mred\x1b[0m\n"
+        in result.output
     )

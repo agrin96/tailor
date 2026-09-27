@@ -1,7 +1,6 @@
 import os
 import sys
 import difflib
-import argparse
 import tokenize
 import subprocess
 from enum import StrEnum
@@ -9,13 +8,15 @@ from pathlib import Path
 from dataclasses import replace, dataclass
 from concurrent.futures import ProcessPoolExecutor
 
+import click
+
 from tailor.keywords import widen_keywords
 from tailor.spacing import space_statements
 from tailor.ordering import order_class_members
-from tailor.constants import Marker, MAXIMUM_RUFF_PASSES
 from tailor.config import Settings, project_root, load_settings
 from tailor.imports import same_meaning, sort_imports, first_party_names
-from tailor.layout import ruff_format, explode_brackets, restyle_brackets
+from tailor.constants import Marker, DIFF_LINE_STYLES, MAXIMUM_RUFF_PASSES
+from tailor.layout import ruff_binary, ruff_format, explode_brackets, restyle_brackets
 
 
 class Mode(StrEnum):
@@ -70,21 +71,28 @@ def format_source(
 
 
 def python_files(*, paths: list[Path]) -> list[Path]:
-    """Each file once, as first spelled, even when arguments overlap: two workers
-    writing one file would lose the output."""
-    files = [
-        file
-        for path in paths
-        for file in (sorted(path.rglob("*.py")) if path.is_dir() else [path])
-        if not any(
-            part.startswith(".") or part == "__pycache__"
-            for part in file.parts[len(path.parts) :]
-        )
+    """The Python files ruff would check under the paths: ruff's default exclusions, the
+    project's exclude settings and .gitignore apply. A file named directly is kept unless
+    ruff's force-exclude is on, as with ruff format. Each file once, even when arguments
+    overlap: two workers writing one file would lose the output."""
+    listing = subprocess.run(
+        [ruff_binary(), "check", "--show-files", *(str(path) for path in paths)],
+        capture_output = True,
+        text = True,
+        check = True,
+    ).stdout
+
+    # keyed by the real file, so a folder and a symlink to it give one path, not two
+    files: dict[Path, Path] = {}
+    for line in listing.splitlines():
+        if line.endswith(".py"):
+            files.setdefault(Path(line).resolve(), Path(line))
+
+    here = Path.cwd()
+    return [
+        file.relative_to(here) if file.is_relative_to(here) else file
+        for file in files.values()
     ]
-    unique = {}
-    for file in files:
-        unique.setdefault(file.resolve(), file)
-    return list(unique.values())
 
 
 def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResult:
@@ -123,6 +131,27 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
         else ""
     )
     return FileResult(path = path, changed = changed, error = None, diff = diff)
+
+
+def colored_diff(*, diff: str) -> str:
+    """The diff with each line colored by its first characters, as git does."""
+    return "".join(
+        colored_line(line = line)
+        for line in diff.splitlines(keepends = True)
+    )
+
+
+def colored_line(*, line: str) -> str:
+    style = next(
+        (style for prefix, style in DIFF_LINE_STYLES if line.startswith(prefix)),
+        None,
+    )
+
+    if style is None:
+        return line
+
+    text = line.rstrip("\n")
+    return click.style(text, **style) + line[len(text) :]
 
 
 def unified_diff(*, before: str, after: str, name: str) -> str:
@@ -166,51 +195,61 @@ def format_files(
         return [futures[path].result() for path in paths]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog = "tailor",
-        description = "ruff format, then house style",
-    )
-    parser.add_argument("paths", nargs = "+", type = Path)
-    parser.add_argument(
-        "--line-length",
-        type = int,
-        help = "replaces line-length from [tool.tailor] or [tool.ruff] in pyproject.toml",
-    )
-    dry_run = parser.add_mutually_exclusive_group()
-    dry_run.add_argument(
-        "--check",
-        action = "store_true",
-        help = "list files that would change, write nothing",
-    )
+@click.command(help = "ruff format, then house style")
+@click.argument(
+    "paths",
+    nargs = -1,
+    required = True,
+    type = click.Path(exists = True, path_type = Path),
+)
+@click.option(
+    "--line-length",
+    type = click.IntRange(min = 1),
+    help = "Replaces line-length from [tool.tailor] or [tool.ruff] in pyproject.toml.",
+)
+@click.option(
+    "--check",
+    is_flag = True,
+    help = "List the files that would change, write nothing.",
+)
+@click.option(
+    "--diff",
+    is_flag = True,
+    help = "Show the changes as a diff, write nothing.",
+)
+@click.version_option(package_name = "pytailor")
+def main(
+    *,
+    paths: tuple[Path, ...],
+    line_length: int | None,
+    check: bool,
+    diff: bool,
+) -> None:
+    if check and diff:
+        raise click.UsageError("--check and --diff cannot be used together")
 
-    dry_run.add_argument(
-        "--diff",
-        action = "store_true",
-        help = "show the changes as a diff, write nothing",
-    )
-    arguments = parser.parse_args()
-    mode = (
-        Mode.DIFF
-        if arguments.diff
-        else Mode.CHECK
-        if arguments.check
-        else Mode.WRITE
-    )
+    mode = Mode.DIFF if diff else Mode.CHECK if check else Mode.WRITE
+    try:
+        files = python_files(paths = list(paths))
+    except subprocess.CalledProcessError as error:
+        raise click.ClickException(
+            f"ruff could not list the files: {error.stderr.strip()}",
+        )
 
-    results = format_files(
-        paths = python_files(paths = arguments.paths),
-        mode = mode,
-        line_length = arguments.line_length,
-    )
+    results = format_files(paths = files, mode = mode, line_length = line_length)
+
+    # color only for a person at a terminal, and never with NO_COLOR set (no-color.org);
+    # color = True keeps click from stripping escape characters that are part of the source
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
     for result in results:
         if result.error:
-            print(f"error: {result.path}: {result.error}", file = sys.stderr)
+            click.echo(f"error: {result.path}: {result.error}", err = True)
         elif result.diff:
-            sys.stdout.write(result.diff)
+            diff = colored_diff(diff = result.diff) if use_color else result.diff
+            click.echo(diff, nl = False, color = True)
         elif result.changed:
-            print(
+            click.echo(
                 f"{'reformatted' if mode == Mode.WRITE else 'would reformat'} {result.path}",
             )
 

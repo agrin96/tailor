@@ -22,6 +22,7 @@ classifiers = [
 ]
 # tailor's output depends on how ruff lays code out, so stay within one ruff minor version
 dependencies = [
+    "click>=8.1",
     "ruff>=0.16.9,<0.17",
 ]
 
