@@ -22,6 +22,7 @@ from tailor.constants import (
     SQL_PARAMETER_NAME,
     DEFAULT_SQL_DIALECT,
     SQL_PARAMETER_PATTERN,
+    SQL_DOLLAR_QUOTE_PATTERN,
     CASE_SENSITIVE_NAME_DIALECTS,
 )
 
@@ -42,27 +43,17 @@ def format_sql_strings(*, source: str, line_length: int, dialect: str) -> str:
         return source
 
     queries = [sql_text(token = token) for token in tokens]
-    masked = [masked_parameters(sql = query) for query in queries]
     widths = [max(line_length - token.start[1], MINIMUM_SQL_WIDTH) for token in tokens]
 
     laid_out = (
-        syntaqlite_layout(queries = [sql for sql, _ in masked], widths = widths)
+        syntaqlite_layout(queries = queries, widths = widths)
         if dialect == DEFAULT_SQL_DIALECT
-        else sqruff_layout(
-            queries = [sql for sql, _ in masked],
-            width = min(widths),
-            dialect = dialect,
-        )
+        else sqruff_layout(queries = queries, width = min(widths), dialect = dialect)
     )
-
-    restored = [
-        None if sql is None else restored_parameters(sql = sql, parameters = parameters)
-        for sql, (_, parameters) in zip(laid_out, masked)
-    ]
 
     edits = [
         (token, rewritten_token(token = token, sql = sql))
-        for token, query, sql in zip(tokens, queries, restored)
+        for token, query, sql in zip(tokens, queries, laid_out)
         if sql is not None
         and sql_signature(sql = sql, dialect = dialect)
         == sql_signature(sql = query, dialect = dialect)
@@ -96,8 +87,8 @@ def syntaqlite_query(*, sql: str, width: int) -> str | None:
 
 def masked_parameters(*, sql: str) -> tuple[str, dict[str, str]]:
     """The SQL with each driver placeholder outside quotes and comments replaced by a plain
-    name, and each name with the placeholder it stands for. No dialect parses every style
-    (`%s` none of them), and a query a dialect cannot parse is not laid out."""
+    name, and each name with the placeholder it stands for. No sqruff dialect parses every
+    style (`%s` none of them), and a query sqruff cannot parse is not laid out."""
     if SQL_PARAMETER_NAME in sql:
         return sql, {}
 
@@ -140,11 +131,12 @@ def is_quoted_or_comment(token: dict) -> bool:
 def sqruff_layout(*, queries: list[str], width: int, dialect: str) -> list[str | None]:
     """All of a file's queries laid out by one sqruff run, or None for a query with a part
     sqruff cannot parse: it lays out the rest of such a query and leaves that part as is."""
+    masked = [masked_parameters(sql = query) for query in queries]
     with tempfile.TemporaryDirectory() as folder:
         config = Path(folder) / "tailor.sqruff"
         config.write_text(SQRUFF_CONFIG.format(dialect = dialect, width = width))
         paths = [Path(folder) / f"query_{index}.sql" for index in range(len(queries))]
-        for path, sql in zip(paths, queries):
+        for path, (sql, _) in zip(paths, masked):
             path.write_text(sql.strip() + "\n")
 
         report = subprocess.run(
@@ -170,8 +162,13 @@ def sqruff_layout(*, queries: list[str], width: int, dialect: str) -> list[str |
             if "| ???? |" in section
         }
         return [
-            None if str(path) in unparsable else path.read_text().strip()
-            for path in paths
+            None
+            if str(path) in unparsable
+            else restored_parameters(
+                sql = path.read_text().strip(),
+                parameters = parameters,
+            )
+            for path, (_, parameters) in zip(paths, masked)
         ]
 
 
@@ -204,8 +201,14 @@ def sql_text(*, token: tokenize.TokenInfo) -> str:
 
 
 def is_safe_to_lay_out(*, sql: str) -> bool:
-    """A backslash is an escape whose meaning a new layout could change."""
-    return "\\" not in sql and not has_significant_line_break(sql = sql)
+    """A backslash is an escape whose meaning a new layout could change. The SQLite
+    tokenizer does not read a dollar-quoted value as one, so it cannot see a line break
+    inside it."""
+    return (
+        "\\" not in sql
+        and not re.search(SQL_DOLLAR_QUOTE_PATTERN, sql)
+        and not has_significant_line_break(sql = sql)
+    )
 
 
 def has_significant_line_break(*, sql: str) -> bool:

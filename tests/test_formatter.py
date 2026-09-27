@@ -994,9 +994,27 @@ rows = db.execute(\"\"\"--sql
     assert run(source, sql_dialect = "postgres") == expected
 
 
+def test_sqlite_values_placeholders_stay_on_one_line():
+    columns = (
+        "id, brand_id, recipient_id, inviter_id, status, expires, accepted_by, created"
+    )
+    source = f'db.executemany("""--sql\ninsert into coach_invites ({columns}) values (?, ?, ?, ?, ?, ?, ?, ?)\n""")\n'
+
+    assert "               VALUES (?, ?, ?, ?, ?, ?, ?, ?)\n" in run(source)
+
+
 def test_sql_that_sqruff_parses_only_in_part_stays_as_written():
     source = 'rows = db.execute("""--sql\nselect a from t where data::jsonb ? \'k\' is not null group by a order by a\n""")\n'
     assert run(source, sql_dialect = "postgres") == source
+
+
+@pytest.mark.parametrize("value", ["$$first\nsecond$$", "$tag$first\nsecond$tag$"])
+def test_sql_with_a_dollar_quoted_value_stays_as_written(value):
+    source = f'def load():\n    query = """--sql\nselect {value} as x from t\n"""\n'
+    result = run(source, sql_dialect = "postgres")
+
+    assert value in result
+    assert run(result, sql_dialect = "postgres") == result
 
 
 def detected(

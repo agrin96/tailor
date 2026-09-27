@@ -213,7 +213,7 @@ row = db.fetch_one(
 - Each `WHERE` condition goes on its own line, with `AND` or `OR` first.
 - Keywords are upper case. Other words, for example function and column names, keep their case.
 - The SQL starts at the column of the opening quotes, and the closing quotes are at the same column.
-- Driver placeholders stay as written: `?`, `?1`, `$1`, `:name`, `@name`, `%s`, and `%(name)s`.
+- Driver placeholders stay as written: `?`, `?1`, `$1`, `:name`, `@name`, `%s`, and `%(name)s`. SQLite does not have `%s` or `%(name)s`, so SQLite SQL with these placeholders stays as written.
 - The SQL stays as written if syntaqlite or sqruff cannot read all of it, if the string has a backslash, if a quoted SQL value or name spans a line break, or if two quoted values are separated by a line break.
 - tailor compares the SQL tokens before and after the layout. If anything other than whitespace or the case of a keyword is different, the SQL stays as written. In a dialect other than SQLite or MySQL, the case of unquoted names can also change.
 

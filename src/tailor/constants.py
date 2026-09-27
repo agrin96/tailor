@@ -167,6 +167,9 @@ SQL_PARAMETER_PATTERN = (
 )
 SQL_PARAMETER_NAME = "tailor_"
 
+# the opening of a PostgreSQL or Snowflake dollar-quoted value: $$ or $tag$
+SQL_DOLLAR_QUOTE_PATTERN = r"\$(?:[A-Za-z_]\w*)?\$"
+
 # the style sqruff lays SQL out in, with the dialect and the line width filled in per run
 SQRUFF_CONFIG = """[sqruff]
 dialect = {dialect}
