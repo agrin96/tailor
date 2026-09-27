@@ -8,8 +8,8 @@ from tailor.tokens import (
     Edit,
     is_code,
     apply_edits,
-    code_tokens,
     find_brackets,
+    list_code_tokens,
     TEMPLATE_DEPTH_CHANGE,
 )
 
@@ -34,7 +34,7 @@ def widen_keywords(*, source: str) -> str:
     # a lambda inside a call can be found both ways: one edit per name
     names = {
         name.end: name
-        for name in keyword_names + lambda_default_names(source = source)
+        for name in keyword_names + find_lambda_default_names(source = source)
         if name.type == tokenize.NAME
     }
 
@@ -50,17 +50,17 @@ def widen_keywords(*, source: str) -> str:
     return apply_edits(source = source, edits = edits)
 
 
-def lambda_default_names(*, source: str) -> list[tokenize.TokenInfo]:
+def find_lambda_default_names(*, source: str) -> list[tokenize.TokenInfo]:
     """The name before each `=` among a lambda's parameters, up to the lambda's own colon.
     A lambda inside an f-string or t-string is left alone: in `{...=}` the spacing is text."""
-    tokens = code_tokens(source = source)
+    tokens = list_code_tokens(source = source)
     template_depths = list(
         itertools.accumulate(
             TEMPLATE_DEPTH_CHANGE.get(token.type, 0)
             for token in tokens
         )
     )
-    names = []
+    names: list[tokenize.TokenInfo] = []
     for index, token in enumerate(tokens):
         if template_depths[index] or not is_code(token = token, string = "lambda"):
             continue
@@ -72,6 +72,12 @@ def lambda_default_names(*, source: str) -> list[tokenize.TokenInfo]:
 
         for position in range(index + 1, len(tokens)):
             current = tokens[position]
+            is_default_sign = (
+                depth == 0
+                and not nested_lambdas
+                and is_code(token = current, string = "=")
+            )
+
             if current.type == tokenize.OP and current.string in BracketText.OPENERS:
                 depth += 1
             elif current.type == tokenize.OP and current.string in BracketText.CLOSERS:
@@ -83,11 +89,7 @@ def lambda_default_names(*, source: str) -> list[tokenize.TokenInfo]:
                     break
 
                 nested_lambdas -= 1
-            elif (
-                depth == 0
-                and not nested_lambdas
-                and is_code(token = current, string = "=")
-            ):
+            elif is_default_sign:
                 names.append(tokens[position - 1])
 
     return names

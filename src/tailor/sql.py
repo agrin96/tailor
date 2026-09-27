@@ -10,138 +10,202 @@ import itertools
 import sysconfig
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 import syntaqlite
 
 from tailor.constants import (
-    SQL_FORMAT,
     SQL_MARKER,
+    SqlDialect,
     SQRUFF_CONFIG,
     TRIPLE_QUOTES,
+    SqlTokenCategory,
     MINIMUM_SQL_WIDTH,
     SQL_PARAMETER_NAME,
-    DEFAULT_SQL_DIALECT,
     SQL_PARAMETER_PATTERN,
+    STRING_PREFIX_LETTERS,
+    QUOTED_SQL_NAME_STARTS,
     SQL_DOLLAR_QUOTE_PATTERN,
-    CASE_SENSITIVE_NAME_DIALECTS,
 )
 
 
-def format_sql_strings(*, source: str, line_length: int, dialect: str) -> str:
+if TYPE_CHECKING:
+    from syntaqlite import Token
+
+
+@dataclass(frozen = True)
+class MaskedQuery:
+    """sql: the query with each driver placeholder replaced by a plain name.
+    parameters: each of those names, with the placeholder it stands for."""
+    sql: str
+    parameters: dict[str, str]
+
+
+def format_sql_strings(
+    *,
+    source: str,
+    line_length: int,
+    dialect: SqlDialect,
+    indent_width: int,
+) -> str:
     """Lay out the SQL of each `\"\"\"--sql` string. A string stays as written when its
     SQL cannot be parsed, when its text has a backslash, when a line break is part of a
     quoted SQL value, or when the layout would change anything but whitespace and case."""
     lines = io.StringIO(source).readlines()
-    tokens = [
+    strings = [
         token
         for token in tokenize.generate_tokens(io.StringIO(source).readline)
         if is_sql_string(token = token)
-        and is_safe_to_lay_out(sql = sql_text(token = token))
     ]
+
+    texts = [
+        token.string.lstrip(STRING_PREFIX_LETTERS)[3 + len(SQL_MARKER) : -3]
+        for token in strings
+    ]
+    safe = [is_safe_to_lay_out(sql = text) for text in texts]
+    tokens = list(itertools.compress(strings, safe))
+    queries = list(itertools.compress(texts, safe))
 
     if not tokens:
         return source
 
-    queries = [sql_text(token = token) for token in tokens]
     widths = [max(line_length - token.start[1], MINIMUM_SQL_WIDTH) for token in tokens]
-
     laid_out = (
-        syntaqlite_layout(queries = queries, widths = widths)
-        if dialect == DEFAULT_SQL_DIALECT
-        else sqruff_layout(queries = queries, width = min(widths), dialect = dialect)
+        [
+            lay_out_with_syntaqlite(
+                sql = query,
+                width = width,
+                indent_width = indent_width,
+            )
+            for query, width in zip(queries, widths)
+        ]
+        if dialect == SqlDialect.SQLITE
+        else lay_out_with_sqruff(
+            queries = queries,
+            width = min(widths),
+            dialect = dialect,
+            indent_width = indent_width,
+        )
     )
 
-    edits = [
-        (token, rewritten_token(token = token, sql = sql))
-        for token, query, sql in zip(tokens, queries, laid_out)
-        if sql is not None
-        and sql_signature(sql = sql, dialect = dialect)
-        == sql_signature(sql = query, dialect = dialect)
-    ]
+    # bottom up, so an edit never moves the rows of a string still ahead
+    for token, query, sql in reversed(list(zip(tokens, queries, laid_out))):
+        if sql is None:
+            continue
 
-    for token, text in reversed(edits):
+        is_same_sql = build_sql_signature(
+            sql = sql,
+            dialect = dialect,
+        ) == build_sql_signature(sql = query, dialect = dialect)
+
+        if not is_same_sql:
+            continue
+
         (start_row, start_column), (end_row, end_column) = token.start, token.end
         lines[start_row - 1 : end_row] = [
             lines[start_row - 1][:start_column]
-            + text
-            + lines[end_row - 1][end_column:],
+            + rewrite_token(token = token, sql = sql)
+            + lines[end_row - 1][end_column:]
         ]
 
     return "".join(lines)
 
 
-def syntaqlite_layout(*, queries: list[str], widths: list[int]) -> list[str | None]:
-    """Each query laid out by syntaqlite, or None for one it cannot parse."""
-    return [
-        syntaqlite_query(sql = sql, width = width)
-        for sql, width in zip(queries, widths)
-    ]
-
-
-def syntaqlite_query(*, sql: str, width: int) -> str | None:
+def lay_out_with_syntaqlite(*, sql: str, width: int, indent_width: int) -> str | None:
+    """The query laid out by syntaqlite, or None when syntaqlite cannot parse it."""
     try:
-        return sql_engine().format_sql(sql, line_width = width, **SQL_FORMAT).strip()
+        return (
+            load_sql_engine()
+            .format_sql(
+                sql,
+                line_width = width,
+                indent_width = indent_width,
+                keyword_case = "upper",
+                semicolons = False,
+            )
+            .strip()
+        )
     except syntaqlite.FormatError:
         return None
 
 
-def masked_parameters(*, sql: str) -> tuple[str, dict[str, str]]:
-    """The SQL with each driver placeholder outside quotes and comments replaced by a plain
-    name, and each name with the placeholder it stands for. No sqruff dialect parses every
-    style (`%s` none of them), and a query sqruff cannot parse is not laid out."""
+def mask_parameters(*, sql: str) -> MaskedQuery:
+    """Replace each driver placeholder outside quotes and comments with a plain name. No
+    sqruff dialect parses every style (`%s` none of them), and a query sqruff cannot parse
+    is not laid out."""
     if SQL_PARAMETER_NAME in sql:
-        return sql, {}
+        return MaskedQuery(sql = sql, parameters = {})
 
-    parameters: dict[str, str] = {}
-
-    def stand_in(match: re.Match) -> str:
-        name = f"{SQL_PARAMETER_NAME}{len(parameters)}"
-        parameters[name] = match.group()
-        return name
-
-    runs = itertools.groupby(sql_engine().tokenize(sql), key = is_quoted_or_comment)
-    masked = "".join(
-        text if quoted else re.sub(SQL_PARAMETER_PATTERN, stand_in, text)
-        for quoted, run in runs
-        for text in ["".join(token["text"] for token in run)]
-    )
-    return masked, parameters
-
-
-def restored_parameters(*, sql: str, parameters: dict[str, str]) -> str:
-    return re.sub(
-        rf"{SQL_PARAMETER_NAME}\d+",
-        lambda match: parameters.get(match.group(), match.group()),
-        sql,
-    )
-
-
-def is_quoted_or_comment(token: dict) -> bool:
-    return (
-        token["category"] in ("string", "comment")
-        or token["text"][:1]
-        in (
-            '"',
-            "`",
-            "[",
+    runs = [
+        (quoted, "".join(token["text"] for token in run))
+        for quoted, run in itertools.groupby(
+            load_sql_engine().tokenize(sql),
+            key = lambda token: (
+                token["category"] in (SqlTokenCategory.STRING, SqlTokenCategory.COMMENT)
+                or token["text"].startswith(QUOTED_SQL_NAME_STARTS)
+            ),
         )
+    ]
+
+    placeholders = [
+        match.group()
+        for quoted, text in runs
+        if not quoted
+        for match in re.finditer(SQL_PARAMETER_PATTERN, text)
+    ]
+
+    # both passes meet the placeholders in the same order, so the numbers line up
+    numbers = itertools.count()
+    masked = "".join(
+        (
+            text
+            if quoted
+            else re.sub(
+                SQL_PARAMETER_PATTERN,
+                lambda _: f"{SQL_PARAMETER_NAME}{next(numbers)}",
+                text,
+            )
+        )
+        for quoted, text in runs
+    )
+
+    return MaskedQuery(
+        sql = masked,
+        parameters = {
+            f"{SQL_PARAMETER_NAME}{number}": placeholder
+            for number, placeholder in enumerate(placeholders)
+        },
     )
 
 
-def sqruff_layout(*, queries: list[str], width: int, dialect: str) -> list[str | None]:
+def lay_out_with_sqruff(
+    *,
+    queries: list[str],
+    width: int,
+    dialect: SqlDialect,
+    indent_width: int,
+) -> list[str | None]:
     """All of a file's queries laid out by one sqruff run, or None for a query with a part
     sqruff cannot parse: it lays out the rest of such a query and leaves that part as is."""
-    masked = [masked_parameters(sql = query) for query in queries]
+    masked = [mask_parameters(sql = query) for query in queries]
     with tempfile.TemporaryDirectory() as folder:
         config = Path(folder) / "tailor.sqruff"
-        config.write_text(SQRUFF_CONFIG.format(dialect = dialect, width = width))
+        config.write_text(
+            SQRUFF_CONFIG.format(
+                dialect = dialect,
+                width = width,
+                indent_width = indent_width,
+            )
+        )
+
         paths = [Path(folder) / f"query_{index}.sql" for index in range(len(queries))]
-        for path, (sql, _) in zip(paths, masked):
-            path.write_text(sql.strip() + "\n")
+        for path, query in zip(paths, masked):
+            path.write_text(query.sql.strip() + "\n")
 
         report = subprocess.run(
             [
-                sqruff_binary(),
+                str(Path(sysconfig.get_path("scripts")) / "sqruff"),
                 "fix",
                 "--parsing-errors",
                 "--config",
@@ -161,43 +225,35 @@ def sqruff_layout(*, queries: list[str], width: int, dialect: str) -> list[str |
             for section in sections
             if "| ???? |" in section
         }
+
         return [
-            None
-            if str(path) in unparsable
-            else restored_parameters(
-                sql = path.read_text().strip(),
-                parameters = parameters,
+            (
+                None
+                if str(path) in unparsable
+                else re.sub(
+                    rf"{SQL_PARAMETER_NAME}\d+",
+                    lambda match: query.parameters.get(match.group(), match.group()),
+                    path.read_text().strip(),
+                )
             )
-            for path, (_, parameters) in zip(paths, masked)
+            for path, query in zip(paths, masked)
         ]
 
 
 @functools.cache
-def sqruff_binary() -> str:
-    """The sqruff program the sqruff package installs beside the Python that runs tailor."""
-    return str(Path(sysconfig.get_path("scripts")) / "sqruff")
-
-
-@functools.cache
-def sql_engine() -> syntaqlite.Syntaqlite:
+def load_sql_engine() -> syntaqlite.Syntaqlite:
     """One syntaqlite engine for each process: it loads the SQLite grammar once."""
     return syntaqlite.Syntaqlite()
 
 
-def rewritten_token(*, token: tokenize.TokenInfo, sql: str) -> str:
+def rewrite_token(*, token: tokenize.TokenInfo, sql: str) -> str:
     """The string token with the SQL placed at the column of its opening quotes."""
-    prefix_length = len(token.string) - len(token.string.lstrip("rRbBuU"))
+    prefix_length = len(token.string) - len(token.string.lstrip(STRING_PREFIX_LETTERS))
     prefix = token.string[:prefix_length]
     quotes = token.string[prefix_length : prefix_length + 3]
     indent = " " * token.start[1]
     body = "".join(f"{indent}{line}\n" if line else "\n" for line in sql.split("\n"))
     return f"{prefix}{quotes}{SQL_MARKER}{body}{indent}{quotes}"
-
-
-def sql_text(*, token: tokenize.TokenInfo) -> str:
-    """The SQL between the marker line and the closing quotes."""
-    prefix_length = len(token.string) - len(token.string.lstrip("rRbBuU"))
-    return token.string[prefix_length + 3 + len(SQL_MARKER) : -3]
 
 
 def is_safe_to_lay_out(*, sql: str) -> bool:
@@ -217,14 +273,19 @@ def has_significant_line_break(*, sql: str) -> bool:
     previous_is_string = False
     break_since_previous = False
 
-    for token in sql_engine().tokenize(sql):
+    for token in load_sql_engine().tokenize(sql):
         text = token["text"]
         if text.isspace():
             break_since_previous = break_since_previous or "\n" in text
             continue
 
-        is_string = token["category"] == "string"
-        if "\n" in text and token["category"] in ("string", "identifier"):
+        is_string = token["category"] == SqlTokenCategory.STRING
+        is_quoted = token["category"] in (
+            SqlTokenCategory.STRING,
+            SqlTokenCategory.IDENTIFIER,
+        )
+
+        if "\n" in text and is_quoted:
             return True
 
         if is_string and previous_is_string and break_since_previous:
@@ -236,41 +297,47 @@ def has_significant_line_break(*, sql: str) -> bool:
     return False
 
 
-def sql_signature(*, sql: str, dialect: str) -> tuple[tuple[str, str], ...]:
+def build_sql_signature(
+    *,
+    sql: str,
+    dialect: SqlDialect,
+) -> tuple[tuple[str, str], ...]:
     """What the SQL means: its tokens without whitespace, keywords in upper case, comments
     with their inner whitespace collapsed. Quoted values count exactly. In a dialect whose
     unquoted names ignore case, those names count in upper case too, because a word that
     SQLite reads as a name can be a keyword elsewhere (`ILIKE`)."""
-    fold_names = dialect not in CASE_SENSITIVE_NAME_DIALECTS
+    fold_names = dialect not in SqlDialect.CASE_SENSITIVE_NAMES
     return tuple(
         (
             token["category"],
-            signature_text(
-                category = token["category"],
-                text = token["text"],
-                fold_names = fold_names,
-            ),
+            normalize_signature_text(token = token, fold_names = fold_names),
         )
-        for token in sql_engine().tokenize(sql)
+        for token in load_sql_engine().tokenize(sql)
         if not token["text"].isspace()
     )
 
 
-def signature_text(*, category: str, text: str, fold_names: bool) -> str:
-    quoted = text[:1] in ('"', "`", "[")
-    match category:
-        case "keyword":
+def normalize_signature_text(*, token: Token, fold_names: bool) -> str:
+    text = token["text"]
+    is_unquoted_name = (
+        token["category"] == SqlTokenCategory.IDENTIFIER
+        and not text.startswith(QUOTED_SQL_NAME_STARTS)
+    )
+
+    match token["category"]:
+        case SqlTokenCategory.KEYWORD:
             return text.upper()
-        case "comment":
+        case SqlTokenCategory.COMMENT:
             return " ".join(text.split())
-        case "identifier" if fold_names and not quoted:
+        case _ if fold_names and is_unquoted_name:
             return text.upper()
-    return text
+        case _:
+            return text
 
 
 def is_sql_string(*, token: tokenize.TokenInfo) -> bool:
     """A triple-quoted string whose text starts with the SQL marker, right after the quotes."""
-    body = token.string.lstrip("rRbBuU")
+    body = token.string.lstrip(STRING_PREFIX_LETTERS)
     return (
         token.type == tokenize.STRING
         and body.startswith(TRIPLE_QUOTES)

@@ -8,74 +8,84 @@ import tomllib
 import functools
 import configparser
 from pathlib import Path
+from dataclasses import dataclass
 
-from tailor.config import Settings
-from tailor.constants import (
-    SQL_DRIVER_MODULES,
-    DEFAULT_SQL_DIALECT,
-    SQL_DRIVER_PACKAGES,
-)
+from tailor.config import Settings, TomlValue, read_table
+from tailor.constants import SqlDialect, SQL_DRIVER_MODULES, SQL_DRIVER_PACKAGES
 
 
-def sql_dialect(
+@dataclass(frozen = True)
+class DialectChoice:
+    """dialect: the dialect of the file's SQL. warning: why the choice is a guess, or None."""
+    dialect: SqlDialect
+    warning: str | None = None
+
+
+def detect_sql_dialect(
     *,
     path: Path,
     root: Path,
     tree: ast.Module,
     settings: Settings,
-) -> tuple[str, str | None]:
-    """The dialect, and a warning when the project's drivers disagree and nothing settles
-    it. In order: [tool.tailor] sql-dialect, the dialect of the nearest .sqruff or .sqlfluff
-    file, the one driver the file imports, the one driver the project depends on, SQLite."""
+) -> DialectChoice:
+    """In order: [tool.tailor] sql-dialect, the dialect of the nearest .sqruff or .sqlfluff
+    file, the one driver the file imports, the one driver the project depends on, SQLite.
+    When the project's drivers disagree and nothing settles it, the choice has a warning."""
     if settings.sql_dialect:
-        return settings.sql_dialect, None
+        return DialectChoice(dialect = settings.sql_dialect)
 
-    configured = linter_dialect(directory = path.resolve().parent)
+    configured = read_linter_dialect(directory = path.resolve().parent)
     if configured:
-        return configured, None
+        return DialectChoice(dialect = configured)
 
-    imported = imported_dialects(tree = tree)
+    imported = find_imported_dialects(tree = tree)
     if len(imported) == 1:
-        return next(iter(imported)), None
+        return DialectChoice(dialect = next(iter(imported)))
 
-    declared = declared_dialects(root = root)
+    declared = read_declared_dialects(root = root)
     if len(declared) == 1:
-        return next(iter(declared)), None
+        return DialectChoice(dialect = next(iter(declared)))
 
     if len(declared | imported) > 1:
         found = ", ".join(sorted(declared | imported))
-        return DEFAULT_SQL_DIALECT, (
-            f"{root / 'pyproject.toml'}: the project uses more than one database ({found}), "
-            f"so tailor reads its SQL as {DEFAULT_SQL_DIALECT}. "
-            "Set sql-dialect in [tool.tailor] to choose."
+        return DialectChoice(
+            dialect = SqlDialect.SQLITE,
+            warning = (
+                f"{root / 'pyproject.toml'}: the project uses more than one database ({found}), "
+                f"so tailor reads its SQL as {SqlDialect.SQLITE}. "
+                "Set sql-dialect in [tool.tailor] to choose."
+            ),
         )
 
-    return DEFAULT_SQL_DIALECT, None
+    return DialectChoice(dialect = SqlDialect.SQLITE)
 
 
 @functools.cache
-def linter_dialect(*, directory: Path) -> str | None:
-    """The dialect of the nearest .sqruff or .sqlfluff file, as those tools read it."""
+def read_linter_dialect(*, directory: Path) -> SqlDialect | None:
+    """The dialect of the nearest .sqruff or .sqlfluff file, as those tools read it. A
+    dialect that sqruff does not know counts as none."""
     for folder in (directory, *directory.parents):
         for name, section in ((".sqruff", "sqruff"), (".sqlfluff", "sqlfluff")):
             config_path = folder / name
-            if config_path.is_file():
-                parser = configparser.ConfigParser()
-                parser.read(config_path)
-                dialect = parser.get(section, "dialect", fallback = None)
-                if dialect:
-                    return dialect
+            if not config_path.is_file():
+                continue
+
+            parser = configparser.ConfigParser()
+            parser.read(config_path)
+            dialect = parser.get(section, "dialect", fallback = None)
+            if dialect:
+                return SqlDialect(dialect) if dialect in SqlDialect else None
 
     return None
 
 
-def imported_dialects(*, tree: ast.Module) -> set[str]:
+def find_imported_dialects(*, tree: ast.Module) -> set[SqlDialect]:
     """The dialects of the database drivers the file imports, anywhere in it."""
     modules = [
         module
         for node in ast.walk(tree)
         if isinstance(node, ast.Import | ast.ImportFrom)
-        for module in imported_modules(node = node)
+        for module in list_imported_modules(node = node)
     ]
     return {
         dialect
@@ -85,52 +95,69 @@ def imported_dialects(*, tree: ast.Module) -> set[str]:
     }
 
 
-def imported_modules(*, node: ast.Import | ast.ImportFrom) -> list[str]:
+def list_imported_modules(*, node: ast.Import | ast.ImportFrom) -> list[str]:
     """`import a.b` gives a.b; `from a import b` gives a and a.b, so either spelling of a
     driver like google.cloud.bigquery counts."""
-    if isinstance(node, ast.Import):
-        return [alias.name for alias in node.names]
-
-    base = node.module or ""
-    return [base, *(f"{base}.{alias.name}" for alias in node.names)]
+    match node:
+        case ast.Import():
+            return [alias.name for alias in node.names]
+        case ast.ImportFrom():
+            base = node.module or ""
+            return [base, *(f"{base}.{alias.name}" for alias in node.names)]
 
 
 @functools.cache
-def declared_dialects(*, root: Path) -> frozenset[str]:
+def read_declared_dialects(*, root: Path) -> frozenset[SqlDialect]:
     """The dialects of the drivers the project's pyproject.toml depends on, in its
-    dependencies, optional dependencies, and dependency groups."""
+    dependencies, optional dependencies, and dependency groups. `psycopg[binary]>=3.1`
+    names psycopg: package names compare in lower case, with dashes."""
     path = root / "pyproject.toml"
     document = tomllib.loads(path.read_text()) if path.is_file() else {}
-    project = document.get("project", {})
+
+    project = read_table(
+        parent = document,
+        key = "project",
+        name = "project",
+        path = path,
+    )
+
+    optional = read_table(
+        parent = project,
+        key = "optional-dependencies",
+        name = "project.optional-dependencies",
+        path = path,
+    )
+
+    groups = read_table(
+        parent = document,
+        key = "dependency-groups",
+        name = "dependency-groups",
+        path = path,
+    )
+
+    lists: list[TomlValue] = [
+        project.get("dependencies", []),
+        *optional.values(),
+        *groups.values(),
+    ]
 
     requirements = [
-        *project.get("dependencies", []),
-        *(
-            item
-            for group in project.get("optional-dependencies", {}).values()
-            for item in group
-        ),
-        *(
-            item
-            for group in document.get("dependency-groups", {}).values()
-            for item in group
-        ),
+        item
+        for group in lists
+        if isinstance(group, list)
+        for item in group
     ]
 
     # a dependency group can include another group as a table, which names no package
     names = {
-        package_name(requirement = requirement)
+        re.sub(r"[._]+", "-", match.group(1).lower())
         for requirement in requirements
         if isinstance(requirement, str)
+        for match in [re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)]
+        if match
     }
     return frozenset(
         SQL_DRIVER_PACKAGES[name]
         for name in names
         if name in SQL_DRIVER_PACKAGES
     )
-
-
-def package_name(*, requirement: str) -> str:
-    """`psycopg[binary]>=3.1` gives psycopg; names compare lower-case with dashes."""
-    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
-    return re.sub(r"[._]+", "-", match.group(1).lower()) if match else ""

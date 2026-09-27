@@ -20,8 +20,12 @@ VALUE_TYPES = (tokenize.NAME, tokenize.NUMBER, tokenize.STRING, *TEMPLATE_ENDS)
 
 @dataclass(frozen = True)
 class Bracket:
-    """Children are the tokens directly inside: nested brackets show only their own
-    opener and closer. The neighbor of a child is always a child, or the bracket itself."""
+    """One bracket pair and what it holds.
+    before: the token right before the opener, or None at the start of the file.
+    opener and closer: the bracket tokens.
+    children: the tokens directly inside. A nested bracket shows only its own opener and
+    closer, so the neighbor of a child is always a child, or the bracket itself.
+    in_template: the bracket is inside an f-string or t-string."""
     before: tokenize.TokenInfo | None
     opener: tokenize.TokenInfo
     children: tuple[tokenize.TokenInfo, ...]
@@ -31,7 +35,8 @@ class Bracket:
 
 @dataclass(frozen = True)
 class OpenBracket:
-    """A bracket whose closer is still ahead. Its children collect as the scan goes on."""
+    """A bracket whose closer is still ahead. The fields are those of Bracket; children
+    collect as the scan goes on."""
     before: tokenize.TokenInfo | None
     opener: tokenize.TokenInfo
     in_template: bool
@@ -49,13 +54,15 @@ class OpenBracket:
 
 @dataclass(frozen = True)
 class Edit:
+    """A replacement of the text between two columns of one row. row: the 1-based row.
+    start_column and end_column: the text to replace. text: what goes in its place."""
     row: int
     start_column: int
     end_column: int
     text: str
 
 
-def code_tokens(*, source: str) -> list[tokenize.TokenInfo]:
+def list_code_tokens(*, source: str) -> list[tokenize.TokenInfo]:
     """Every token except line breaks inside brackets and comments."""
     return [
         token
@@ -65,8 +72,8 @@ def code_tokens(*, source: str) -> list[tokenize.TokenInfo]:
 
 
 def find_brackets(*, source: str) -> list[Bracket]:
-    tokens = code_tokens(source = source)
-    brackets = []
+    tokens = list_code_tokens(source = source)
+    brackets: list[Bracket] = []
     open_brackets: list[OpenBracket] = []
     template_depth = 0
 
@@ -111,11 +118,13 @@ def is_comprehension(*, bracket: Bracket) -> bool:
 
 def is_explodable(*, bracket: Bracket) -> bool:
     """A comma separated list where a trailing comma is legal: call, definition, import, literal."""
-    if (
+    has_no_room = (
         bracket.in_template
         or not bracket.children
         or is_code(token = bracket.children[-1], string = ",")
-    ):
+    )
+
+    if has_no_room:
         return False
 
     if is_comprehension(bracket = bracket):
@@ -163,14 +172,7 @@ def ends_value(*, token: tokenize.TokenInfo) -> bool:
     )
 
 
-def ends_in_comment(*, bracket: Bracket, lines: list[str]) -> bool:
-    """A comment after the packed line is often why ruff kept it apart: splitting the line
-    would leave the comment on the last piece only."""
-    last = bracket.children[-1]
-    return lines[last.end[0] - 1][last.end[1] :].lstrip().startswith("#")
-
-
-def comprehension_clause_indexes(
+def find_comprehension_clause_indexes(
     *,
     children: tuple[tokenize.TokenInfo, ...],
 ) -> list[int]:
@@ -181,7 +183,6 @@ def comprehension_clause_indexes(
         if is_code(token = child, string = "for")
     ]
 
-    # an `async for` clause starts at its `async`
     async_indexes = [
         index - 1
         for index in for_indexes

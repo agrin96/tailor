@@ -118,6 +118,7 @@ assignment-group-size = 3
 long-body-lines = 2
 short-dunder-lines = 2
 constructors = ["__new__", "__init__", "__post_init__"]
+sql-indent-width = 2
 ```
 
 | Option | Default | What it sets |
@@ -131,6 +132,7 @@ constructors = ["__new__", "__init__", "__post_init__"]
 | `short-dunder-lines` | 2 | Dunders with a body of this many lines or fewer have 1 blank line between them. |
 | `constructors` | `__new__`, `__init__`, `__post_init__` | The dunders that come first in a class. |
 | `sql-dialect` | found per file, see [SQL](#sql) | The SQL dialect of `--sql` strings, for example `"postgres"`. |
+| `sql-indent-width` | 2 | The indent of a SQL clause or subquery. |
 
 If an option is unknown or has the wrong type, tailor stops with an error that names the file.
 
@@ -209,7 +211,7 @@ row = db.fetch_one(
 )
 ```
 
-- A clause or a subquery that fits on one line stays on one line. One that does not fit breaks onto its own lines, with an indent of 2 spaces.
+- A clause or a subquery that fits on one line stays on one line. One that does not fit breaks onto its own lines, with an indent of `sql-indent-width` spaces.
 - Each `WHERE` condition goes on its own line, with `AND` or `OR` first.
 - Keywords are upper case. Other words, for example function and column names, keep their case.
 - The SQL starts at the column of the opening quotes, and the closing quotes are at the same column.

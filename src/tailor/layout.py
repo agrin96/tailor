@@ -2,16 +2,17 @@
 the lines ruff packed and restore the widened keywords."""
 
 import io
-import functools
 import subprocess
+from dataclasses import dataclass
 
 from ruff.__main__ import find_ruff_bin
 
 from tailor.constants import Marker
 from tailor.operators import (
-    split_markers,
+    insert_split_markers,
     remove_split_markers,
-    expression_break_indexes,
+    parenthesize_conditionals,
+    find_expression_break_indexes,
 )
 from tailor.tokens import (
     Edit,
@@ -21,15 +22,16 @@ from tailor.tokens import (
     find_brackets,
     follows_value,
     is_explodable,
-    ends_in_comment,
     is_comprehension,
-    comprehension_clause_indexes,
+    find_comprehension_clause_indexes,
 )
 
 
-@functools.cache
-def ruff_binary() -> str:
-    return find_ruff_bin()
+@dataclass(frozen = True)
+class ExplodedSource:
+    """source: the code after the last ruff run. brackets: the brackets in that code."""
+    source: str
+    brackets: list[Bracket]
 
 
 def ruff_format(
@@ -43,7 +45,7 @@ def ruff_format(
     on an earlier run must not keep a bracket split after the code got shorter."""
     # ponytail: one ruff process per file per pass (~4 ms each), batching means copying ruff's config discovery
     command = [
-        ruff_binary(),
+        find_ruff_bin(),
         "format",
         "--line-length",
         str(line_length),
@@ -69,10 +71,10 @@ def explode_brackets(
     filename: str,
     use_split_markers: bool,
     passes_left: int,
-) -> tuple[str, list[Bracket]]:
+) -> ExplodedSource:
     """Add a magic trailing comma to every bracket ruff packed onto one indented line, mark
-    operator expressions ruff split inside one operand, and run ruff again. Repeat until nothing is left to
-    explode. Returns the source and its brackets.
+    operator expressions ruff split inside one operand, put split conditionals in
+    parentheses, and run ruff again. Repeat until nothing is left to explode.
     Pass use_split_markers False when the marker name is already in the code: removing
     markers would then also remove the code's own text. passes_left caps the ruff runs:
     in a region ruff leaves alone (fmt: off) a layout may never settle."""
@@ -91,19 +93,19 @@ def explode_brackets(
     ]
 
     # markers go in alone: a comma added now would explode an operand that fits once split
-    markers = split_markers(source = formatted) if use_split_markers else []
-    edits = markers or commas
+    markers = insert_split_markers(source = formatted) if use_split_markers else []
+    edits = markers or parenthesize_conditionals(source = formatted) or commas
 
-    if (
-        (not edits or not passes_left)
-        and use_split_markers
-        and Marker.SPLIT in formatted
-    ):
+    is_done = not edits or not passes_left
+    if is_done and use_split_markers and Marker.SPLIT in formatted:
         unmarked = remove_split_markers(source = formatted)
-        return unmarked, find_brackets(source = unmarked)
+        return ExplodedSource(
+            source = unmarked,
+            brackets = find_brackets(source = unmarked),
+        )
 
-    if not edits or not passes_left:
-        return formatted, brackets
+    if is_done:
+        return ExplodedSource(source = formatted, brackets = brackets)
 
     reformatted = ruff_format(
         source = apply_edits(source = formatted, edits = edits),
@@ -124,16 +126,21 @@ def restyle_brackets(*, source: str, brackets: list[Bracket]) -> str:
     operator expression, its own line. Turn every widened keyword back into `name = `: the
     same width, so no column moves."""
     lines = io.StringIO(source).readlines()
+
+    # a comment after the packed line is often why ruff kept it apart: splitting the line
+    # would leave the comment on the last piece only
     line_breaks = [
         edit
         for bracket in brackets
         if not bracket.in_template
         and is_hugged(bracket = bracket)
-        and not ends_in_comment(bracket = bracket, lines = lines)
-        for edit in line_break_edits(
+        and not lines[bracket.children[-1].end[0] - 1][bracket.children[-1].end[1] :]
+        .lstrip()
+        .startswith("#")
+        for edit in build_line_break_edits(
             bracket = bracket,
             lines = lines,
-            indexes = break_indexes(bracket = bracket),
+            indexes = find_break_indexes(bracket = bracket),
         )
     ]
 
@@ -145,18 +152,18 @@ def restyle_brackets(*, source: str, brackets: list[Bracket]) -> str:
     return spaced.replace(Marker.WIDENER, "")
 
 
-def break_indexes(*, bracket: Bracket) -> list[int]:
+def find_break_indexes(*, bracket: Bracket) -> list[int]:
     """The children that start a new line when the bracket's one packed line is split."""
     if is_comprehension(bracket = bracket):
-        return comprehension_clause_indexes(children = bracket.children)
+        return find_comprehension_clause_indexes(children = bracket.children)
 
     if bracket.opener.string == "(" and not follows_value(bracket = bracket):
-        return expression_break_indexes(children = bracket.children)
+        return find_expression_break_indexes(children = bracket.children)
 
     return []
 
 
-def line_break_edits(
+def build_line_break_edits(
     *,
     bracket: Bracket,
     lines: list[str],
