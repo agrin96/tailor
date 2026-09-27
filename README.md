@@ -74,7 +74,7 @@ class Builder:
 uv tool install pytailor
 ```
 
-tailor runs on Python 3.14, and `uv` gets it for you. It formats projects that target Python 3.12 to 3.14. It reads the target the same way ruff does. If a project targets another version, tailor stops before it changes a file.
+tailor runs on Python 3.14, and `uv` gets it for you. It formats projects that target Python 3.12 to 3.14. It reads the target the same way ruff does. If a project targets another version, tailor stops before it changes a file. For a project that targets Python 3.12 or 3.13, ruff adds `from __future__ import annotations` to each file.
 
 ## Usage
 
@@ -166,6 +166,8 @@ The numbers below are the defaults.
 - Local imports are relative imports, and the packages and modules in the project root or its `src/` folder.
 - If comments are between the imports, or two imports bind the same name, the import order stays as written.
 - Module-level `type` statements move up to after the imports and the `logger = ...` line, unless a statement above them uses their name.
+- An alias value can use a module-level function, class or constant as a value: in a call, or in the metadata of `Annotated`. That definition moves up above the aliases, with its decorators and the comments above it. The definitions that it uses when Python defines it move too. Function bodies do not count. Annotations count only if tailor finds no target Python for the project.
+- If such a definition cannot move, the aliases keep their place, and tailor shows a warning with the alias and the name. For example, a definition that uses an alias in a default value cannot move, and a name that the file binds twice cannot move.
 
 </details>
 
@@ -216,8 +218,9 @@ tailor finds the dialect of each file in this order:
 
 - Do not run `ruff format` after tailor. It reverses the keyword spacing, the comprehension layout and the blank lines.
 - Turn off ruff's import sorting (`I`), and the pycodestyle rules for `=` spacing (E251, E252) and blank lines (E30x). The other `ruff check` rules can stay. tailor uses your ruff formatter settings, such as `quote-style`.
-- tailor compares the syntax tree of ruff's output with its own result. If anything other than the import, class member and `type` statement order changed, it writes nothing and shows an error.
+- tailor compares the syntax tree of ruff's output with its own result. If anything other than the order of the imports, the class members, the `type` statements and the definitions that the aliases use changed, it writes nothing and shows an error.
 - tailor moves class members without a check of what they use when the class is created. A decorator or default value that uses another member of the class can fail after the move.
+- A definition that moves above the aliases runs earlier when Python loads the module. If its decorator or its value has a side effect, that side effect also occurs earlier. An example is the registration order of routes.
 - tailor also changes `# fmt: off` and `# fmt: skip` regions. A file that contains `ǂǂ` is not formatted: tailor uses these characters while ruff runs.
 
 ## License

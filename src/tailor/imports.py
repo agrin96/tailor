@@ -7,8 +7,10 @@ from enum import IntEnum
 from pathlib import Path
 from dataclasses import dataclass
 
+from tailor.config import PythonVersion
 from tailor.sql import build_sql_signature
 from tailor.constants import SQL_MARKER, SqlDialect
+from tailor.ordering import AliasBlock, plan_alias_block
 from tailor.syntax import is_docstring, find_last_row, classify_member
 
 
@@ -249,19 +251,46 @@ def write_from_import(
     return f"{head} (\n" + "".join(f"{indent}{name},\n" for name in names) + ")"
 
 
-def have_same_meaning(*, before: str, after: str, sql_dialect: SqlDialect) -> bool:
+def have_same_meaning(
+    *,
+    before: str,
+    after: str,
+    sql_dialect: SqlDialect,
+    target: PythonVersion | None,
+) -> bool:
     """True when both sources have the same top-level imports, in any order, and the
     same other statements, in order. Positions are ignored."""
-    before_meaning = extract_meaning(source = before, sql_dialect = sql_dialect)
-    after_meaning = extract_meaning(source = after, sql_dialect = sql_dialect)
+    before_meaning = extract_meaning(
+        source = before,
+        sql_dialect = sql_dialect,
+        target = target,
+    )
+
+    after_meaning = extract_meaning(
+        source = after,
+        sql_dialect = sql_dialect,
+        target = target,
+    )
+
     return (
         before_meaning.imports == after_meaning.imports
         and ast.compare(before_meaning.rest, after_meaning.rest)
     )
 
 
-def extract_meaning(*, source: str, sql_dialect: SqlDialect) -> CodeMeaning:
+def extract_meaning(
+    *,
+    source: str,
+    sql_dialect: SqlDialect,
+    target: PythonVersion | None,
+) -> CodeMeaning:
     body = ast.parse(source).body
+    match plan_alias_block(body = body, target = target):
+        case AliasBlock(dependencies = dependencies):
+            moved = dependencies
+        case _:
+            moved = []
+
     imports = [
         statement
         for statement in body
@@ -292,10 +321,16 @@ def extract_meaning(*, source: str, sql_dialect: SqlDialect) -> CodeMeaning:
         if isinstance(statement, ast.TypeAlias)
     ]
 
-    # aliases of different names may trade places; two of one name keep their order
+    # aliases of different names may trade places; two of one name keep their order; the
+    # definitions the aliases need lead, in written order
     sorted_aliases = sorted(aliases, key = lambda alias: alias.name.id)
     rest.body = [
-        *(statement for statement in rest.body if statement not in aliases),
+        *moved,
+        *(
+            statement
+            for statement in rest.body
+            if statement not in aliases and statement not in moved
+        ),
         *sorted_aliases,
     ]
 

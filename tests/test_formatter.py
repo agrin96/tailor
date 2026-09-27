@@ -1,5 +1,8 @@
 import ast
+import sys
+import json
 import textwrap
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,7 +12,13 @@ from tailor import app, color_diff
 from tailor.constants import SqlDialect
 from tailor.imports import sort_imports
 from tailor.operators import remove_split_markers
-from tailor.formatter import Mode, format_file, format_source, list_python_files
+from tailor.formatter import (
+    Mode,
+    format_file,
+    format_source,
+    FormattedSource,
+    list_python_files,
+)
 from tailor.dialects import (
     DialectChoice,
     detect_sql_dialect,
@@ -19,6 +28,7 @@ from tailor.dialects import (
 from tailor.config import (
     Settings,
     PythonTarget,
+    PythonVersion,
     load_settings,
     parse_lower_bound,
     find_project_python,
@@ -30,18 +40,29 @@ from tailor.config import (
 FIRST_PARTY = frozenset({"jobs", "worker"})
 
 
-def run(
+def format_sample(
     source: str,
     line_length: int = 88,
     sql_dialect: SqlDialect = SqlDialect.SQLITE,
-) -> str:
+    target: PythonVersion = (3, 14),
+) -> FormattedSource:
     return format_source(
         source = textwrap.dedent(source),
         filename = "sample.py",
         first_party = FIRST_PARTY,
         settings = Settings(line_length = line_length),
         sql_dialect = sql_dialect,
+        target = target,
     )
+
+
+def run(
+    source: str,
+    line_length: int = 88,
+    sql_dialect: SqlDialect = SqlDialect.SQLITE,
+    target: PythonVersion = (3, 14),
+) -> str:
+    return format_sample(source, line_length, sql_dialect, target).source
 
 
 def test_house_style():
@@ -1263,3 +1284,317 @@ def test_sql_with_implicit_aliases_is_formatted():
         f'{indent}"""\n'
     )
     assert run(source) == expected
+
+
+# name: (source, the output); each output passes basedpyright, and a second run keeps it
+ALIAS_CASES = {
+    "fastapi_dependencies": (
+        """
+        from typing import Annotated
+        from fastapi import Query, Header, Depends, Request
+        from common.storage import Storage
+
+        type DatabaseStorage = Annotated[Storage, Depends(get_storage)]
+        type UserId = Annotated[str, Depends(current_user)]
+        type Cursor = Annotated[str | None, Query()]
+        type Limit = Annotated[int, Query(ge = 1, le = 100)]
+
+
+        def page(user: UserId, cursor: Cursor, limit: Limit) -> list[str]:
+            return [user]
+
+
+        async def get_storage(request: Request) -> Storage:
+            return request.app.state.storage
+
+
+        async def current_user(
+            storage: DatabaseStorage,
+            authorization: str | None = Header(default = None),
+        ) -> str:
+            return authorization or ""
+        """,
+        """\
+        from typing import Annotated
+
+        from common.storage import Storage
+        from fastapi import Query, Header, Depends, Request
+
+
+        async def get_storage(request: Request) -> Storage:
+            return request.app.state.storage
+
+
+        async def current_user(
+            storage: DatabaseStorage,
+            authorization: str | None = Header(default = None),
+        ) -> str:
+            return authorization or ""
+
+
+        type DatabaseStorage = Annotated[Storage, Depends(get_storage)]
+        type UserId = Annotated[str, Depends(current_user)]
+        type Cursor = Annotated[str | None, Query()]
+        type Limit = Annotated[int, Query(ge = 1, le = 100)]
+
+
+        def page(user: UserId, cursor: Cursor, limit: Limit) -> list[str]:
+            return [user]
+        """,
+    ),
+    "validator_below_the_alias": (
+        """
+        from typing import Annotated
+        from pydantic import AfterValidator
+
+        type Slug = Annotated[str, AfterValidator(check_slug)]
+
+
+        def check_slug(value: str) -> str:
+            return value.lower()
+        """,
+        """\
+        from typing import Annotated
+
+        from pydantic import AfterValidator
+
+
+        def check_slug(value: str) -> str:
+            return value.lower()
+
+
+        type Slug = Annotated[str, AfterValidator(check_slug)]
+        """,
+    ),
+    "constant_below_the_alias": (
+        """
+        from typing import Annotated
+        from pydantic import Field
+
+        type Title = Annotated[str, Field(max_length = TITLE_LIMIT)]
+
+        TITLE_LIMIT = 120
+        """,
+        """\
+        from typing import Annotated
+
+        from pydantic import Field
+
+
+        TITLE_LIMIT = 120
+
+        type Title = Annotated[str, Field(max_length = TITLE_LIMIT)]
+        """,
+    ),
+    "chain_of_constants": (
+        """
+        from typing import Annotated
+        from pydantic import Field
+
+        type Title = Annotated[str, Field(max_length = LIMIT)]
+
+        OTHER = 1
+        BASE = 60
+        LIMIT = BASE * 2
+        """,
+        """\
+        from typing import Annotated
+
+        from pydantic import Field
+
+
+        BASE = 60
+        LIMIT = BASE * 2
+
+        type Title = Annotated[str, Field(max_length = LIMIT)]
+
+        OTHER = 1
+        """,
+    ),
+    "class_in_a_type_position": (
+        """
+        from dataclasses import dataclass
+
+
+        @dataclass
+        class Node:
+            name: str
+
+
+        type Pair = tuple[Node, Node]
+        """,
+        """\
+        from dataclasses import dataclass
+
+
+        type Pair = tuple[Node, Node]
+
+
+        @dataclass
+        class Node:
+            name: str
+        """,
+    ),
+    "decorated_helper_with_a_comment": (
+        """
+        import functools
+        from typing import Annotated
+        from fastapi import Depends
+
+        type Config = Annotated[dict[str, str], Depends(load_config)]
+
+
+        def page(config: Config) -> None:
+            pass
+
+
+        # read once per process
+        @functools.cache
+        def load_config() -> dict[str, str]:
+            return {}
+        """,
+        """\
+        import functools
+        from typing import Annotated
+
+        from fastapi import Depends
+
+
+        # read once per process
+        @functools.cache
+        def load_config() -> dict[str, str]:
+            return {}
+
+
+        type Config = Annotated[dict[str, str], Depends(load_config)]
+
+
+        def page(config: Config) -> None:
+            pass
+        """,
+    ),
+    "aliases_without_dependencies": (
+        """
+        from typing import Annotated
+        from fastapi import Query
+
+        PAGE_SIZE = 20
+
+
+        def clamp(value: int) -> int:
+            return min(value, PAGE_SIZE)
+
+
+        # the page to start from
+        type Cursor = Annotated[str | None, Query()]
+        type Limit = Annotated[int, Query(ge = 1, le = 100)]
+        """,
+        """\
+        from typing import Annotated
+
+        from fastapi import Query
+
+
+        # the page to start from
+        type Cursor = Annotated[str | None, Query()]
+        type Limit = Annotated[int, Query(ge = 1, le = 100)]
+
+        PAGE_SIZE = 20
+
+
+        def clamp(value: int) -> int:
+            return min(value, PAGE_SIZE)
+        """,
+    ),
+}
+
+ALIAS_CYCLE = """\
+import sys
+from typing import Annotated
+
+from fastapi import Query, Depends
+
+
+if sys.platform == "darwin":
+    DEFAULT_LIMIT = 50
+else:
+    DEFAULT_LIMIT = 100
+
+
+def read_limit(limit: int = Query(default = DEFAULT_LIMIT)) -> int:
+    return limit
+
+
+type Limit = Annotated[int, Depends(read_limit)]
+"""
+
+
+@pytest.mark.parametrize("name", ALIAS_CASES)
+def test_definitions_an_alias_value_needs_move_above_the_aliases(name):
+    source, expected = ALIAS_CASES[name]
+    result = run(source)
+
+    assert result == textwrap.dedent(expected)
+    assert run(result) == result
+
+
+def test_alias_that_needs_a_definition_that_cannot_move_keeps_its_place(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nrequires-python = ">=3.14"\n')
+    (tmp_path / "module.py").write_text(ALIAS_CYCLE)
+    result = format_file(
+        path = tmp_path / "module.py",
+        mode = Mode.CHECK,
+        line_length = None,
+    )
+
+    assert not result.changed and result.error is None
+    assert [
+        warning
+        for warning in result.warnings
+        if "Limit" in warning and "DEFAULT_LIMIT" in warning
+    ]
+
+
+def test_older_targets_get_future_annotations_so_dependencies_still_move():
+    source, expected = ALIAS_CASES["fastapi_dependencies"]
+    result = run(source, target = (3, 12))
+
+    assert result == "from __future__ import annotations\n\n" + textwrap.dedent(
+        expected,
+    )
+    assert run(result, target = (3, 12)) == result
+
+
+def test_moved_aliases_pass_the_type_checker(tmp_path):
+    outputs = {
+        (3, 14): [run(source) for source, _ in ALIAS_CASES.values()] + [ALIAS_CYCLE],
+        (3, 12): [run(ALIAS_CASES["fastapi_dependencies"][0], target = (3, 12))],
+    }
+
+    for (major, minor), sources in outputs.items():
+        folder = tmp_path / f"py{major}{minor}"
+        folder.mkdir()
+        (folder / "pyrightconfig.json").write_text('{"typeCheckingMode": "strict"}')
+        for index, source in enumerate(sources):
+            (folder / f"case_{index}.py").write_text(source)
+
+        report = subprocess.run(
+            [
+                Path(sys.executable).parent / "basedpyright",
+                "--outputjson",
+                "--pythonversion",
+                f"{major}.{minor}",
+            ],
+            cwd = folder,
+            capture_output = True,
+            text = True,
+            # the unresolved fastapi and pydantic imports make basedpyright exit 1
+            check = False,
+        )
+
+        undefined = [
+            diagnostic
+            for diagnostic in json.loads(report.stdout)["generalDiagnostics"]
+            if diagnostic.get("rule") == "reportUndefinedVariable"
+        ]
+        assert undefined == []

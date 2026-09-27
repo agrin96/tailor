@@ -19,10 +19,27 @@ from tailor.spacing import space_statements
 from tailor.strings import close_class_docstrings
 from tailor.dialects import DialectChoice, detect_sql_dialect
 from tailor.ordering import order_type_aliases, order_class_members
-from tailor.config import Settings, load_settings, find_project_root
-from tailor.layout import ruff_format, explode_brackets, restyle_brackets
-from tailor.constants import Marker, SQL_MARKER, SqlDialect, MAXIMUM_RUFF_PASSES
 from tailor.imports import sort_imports, have_same_meaning, list_first_party_names
+from tailor.layout import (
+    ruff_format,
+    explode_brackets,
+    restyle_brackets,
+    add_future_annotations,
+)
+from tailor.config import (
+    Settings,
+    PythonVersion,
+    load_settings,
+    find_project_root,
+    find_project_python,
+)
+from tailor.constants import (
+    Marker,
+    SQL_MARKER,
+    SqlDialect,
+    MAXIMUM_RUFF_PASSES,
+    LAZY_ANNOTATIONS_PYTHON,
+)
 
 
 class Mode(StrEnum):
@@ -36,12 +53,19 @@ class Mode(StrEnum):
 class FileResult:
     """path: the file. changed: the file changed, or would change under check or diff.
     error: why the file was not formatted, or None. diff: the change as a patch, in diff
-    mode. warning: a note about the file's SQL dialect, or None."""
+    mode. warnings: notes about the file's SQL dialect and its type aliases."""
     path: Path
     changed: bool
     error: str | None
     diff: str
-    warning: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen = True)
+class FormattedSource:
+    """source: the formatted code. warnings: notes about what formatting left as it is."""
+    source: str
+    warnings: tuple[str, ...]
 
 
 def format_source(
@@ -51,9 +75,19 @@ def format_source(
     first_party: frozenset[str],
     settings: Settings,
     sql_dialect: SqlDialect,
-) -> str:
+    target: PythonVersion | None,
+) -> FormattedSource:
+    """Format one module. Code that targets a Python older than LAZY_ANNOTATIONS_PYTHON
+    gets `from __future__ import annotations` first, so its annotations are lazy too."""
+    needs_future_annotations = target is not None and target < LAZY_ANNOTATIONS_PYTHON
+    prepared = (
+        add_future_annotations(source = source, filename = filename)
+        if needs_future_annotations
+        else source
+    )
+
     formatted = ruff_format(
-        source = widen_keywords(source = source),
+        source = widen_keywords(source = prepared),
         line_length = settings.line_length,
         filename = filename,
         keep_trailing_commas = False,
@@ -74,9 +108,9 @@ def format_source(
         source = sorted_imports,
         constructors = settings.constructors,
     )
-    aliased = order_type_aliases(source = ordered)
+    aliased = order_type_aliases(source = ordered, target = target)
     closed = close_class_docstrings(
-        source = aliased,
+        source = aliased.source,
         line_length = settings.line_length,
     )
 
@@ -95,11 +129,16 @@ def format_source(
         before = formatted.replace(Marker.WIDENER, ""),
         after = result,
         sql_dialect = sql_dialect,
+        target = target,
     )
 
     if not keeps_meaning:
         raise ValueError("house style changed what the code means, output discarded")
-    return result
+
+    return FormattedSource(
+        source = result,
+        warnings = (f"{filename}: {aliased.warning}",) if aliased.warning else (),
+    )
 
 
 def list_python_files(*, paths: list[Path]) -> list[Path]:
@@ -146,7 +185,8 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
             else DialectChoice(dialect = SqlDialect.SQLITE)
         )
 
-        result = format_source(
+        target = find_project_python(directory = path.resolve().parent)
+        formatted = format_source(
             source = source,
             filename = str(path),
             first_party = list_first_party_names(root = root),
@@ -156,6 +196,7 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
                 else settings
             ),
             sql_dialect = choice.dialect,
+            target = target.version if target else None,
         )
     except subprocess.CalledProcessError as error:
         return FileResult(
@@ -167,7 +208,9 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
     except (OSError, ValueError, SyntaxError, tokenize.TokenError) as error:
         return FileResult(path = path, changed = False, error = str(error), diff = "")
 
+    result = formatted.source
     changed = result != source
+
     if changed and mode == Mode.WRITE:
         path.write_text(result)
 
@@ -181,7 +224,11 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
         changed = changed,
         error = None,
         diff = diff,
-        warning = choice.warning,
+        warnings = (
+            (choice.warning, *formatted.warnings)
+            if choice.warning
+            else formatted.warnings
+        ),
     )
 
 

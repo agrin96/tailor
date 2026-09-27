@@ -102,11 +102,11 @@ def format_command(
                 f"{'reformatted' if mode == Mode.WRITE else 'would reformat'} {result.path}",
             )
 
-    # one project's warning comes from each of its files with SQL: show it once
+    # one project's dialect warning comes from each of its files with SQL: show it once
     for warning in dict.fromkeys(
-        result.warning
+        warning
         for result in results
-        if result.warning
+        for warning in result.warnings
     ):
         typer.echo(f"warning: {warning}", err = True)
 

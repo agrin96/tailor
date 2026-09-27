@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from ruff.__main__ import find_ruff_bin
 
-from tailor.constants import Marker
+from tailor.constants import Marker, FUTURE_ANNOTATIONS_CONFIG
 from tailor.operators import (
     insert_split_markers,
     remove_split_markers,
@@ -51,6 +51,32 @@ def ruff_format(
         str(line_length),
         "--config",
         f"format.skip-magic-trailing-comma = {str(not keep_trailing_commas).lower()}",
+        "--stdin-filename",
+        filename,
+        "-",
+    ]
+    return subprocess.run(
+        command,
+        input = source,
+        capture_output = True,
+        text = True,
+        check = True,
+    ).stdout
+
+
+def add_future_annotations(*, source: str, filename: str) -> str:
+    """The source with `from __future__ import annotations`, added by ruff's required-imports
+    fix (I002) when the file lacks it."""
+    command = [
+        find_ruff_bin(),
+        "check",
+        "--select",
+        "I002",
+        "--fix",
+        "--exit-zero",
+        "--quiet",
+        "--config",
+        FUTURE_ANNOTATIONS_CONFIG,
         "--stdin-filename",
         filename,
         "-",

@@ -40,6 +40,11 @@ class SoftKeyword(StrEnum):
 
 MAXIMUM_RUFF_PASSES = 10
 
+# ruff adds this import to code that targets an older Python than LAZY_ANNOTATIONS_PYTHON
+FUTURE_ANNOTATIONS_CONFIG = (
+    'lint.isort.required-imports = ["from __future__ import annotations"]'
+)
+
 # loosest first: a wrapped expression splits at the loosest operator in it
 OPERATOR_TIERS: tuple[dict[type[ast.operator], str], ...] = (
     {ast.BitOr: "|"},
@@ -176,3 +181,6 @@ capitalisation_policy = upper
 """
 
 MINIMUM_PROJECT_PYTHON = (3, 12)
+
+# the first Python that evaluates annotations only when they are read
+LAZY_ANNOTATIONS_PYTHON = (3, 14)

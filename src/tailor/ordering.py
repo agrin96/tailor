@@ -1,8 +1,13 @@
 import io
 import re
 import ast
+import builtins
+from collections import Counter
+from dataclasses import dataclass
+from collections.abc import Iterator
 
-from tailor.constants import MemberKind, LOGGER_NAME
+from tailor.config import PythonVersion
+from tailor.constants import MemberKind, LOGGER_NAME, LAZY_ANNOTATIONS_PYTHON
 from tailor.syntax import (
     is_docstring,
     find_last_row,
@@ -10,6 +15,30 @@ from tailor.syntax import (
     classify_member,
     find_body_end_row,
 )
+
+
+@dataclass(frozen = True)
+class AliasBlock:
+    """dependencies: the definitions that move above the aliases, in written order.
+    aliases: the `type` statements that move, in written order."""
+    dependencies: list[ast.stmt]
+    aliases: list[ast.TypeAlias]
+
+
+@dataclass(frozen = True)
+class AliasCycle:
+    """alias: the alias whose value needs the name. name: the name that cannot move above
+    the aliases."""
+    alias: str
+    name: str
+
+
+@dataclass(frozen = True)
+class OrderedAliases:
+    """source: the module after the pass. warning: why the aliases kept their place, or
+    None."""
+    source: str
+    warning: str | None = None
 
 
 def order_class_members(*, source: str, constructors: tuple[str, ...]) -> str:
@@ -146,25 +175,379 @@ def rank_member_group(
     return kind, 1, length
 
 
-def order_type_aliases(*, source: str) -> str:
+def order_type_aliases(*, source: str, target: PythonVersion | None) -> OrderedAliases:
     """Move the top-level `type` statements up, in written order, to right after the imports
-    and the logger. The alias's value is evaluated lazily, but its name is bound where the
-    statement stands: an alias stays when a statement it would move past uses that name."""
+    and the logger, with the definitions their values need above them. The alias's value is
+    evaluated lazily, but its name is bound where the statement stands: an alias stays when
+    a statement it would move past uses that name. When a needed definition cannot move, the
+    aliases keep their place and the result has a warning."""
     body = ast.parse(source).body
-    anchor = count_leading_statements(body = body)
+    plan = plan_alias_block(body = body, target = target)
 
-    aliases = [
-        statement
-        for index, statement in enumerate(body)
-        if isinstance(statement, ast.TypeAlias)
-        # a wildcard import can bind any name, so no alias moves past one
-        and not any(
-            {statement.name.id, "*"} & list_bound_or_used_names(statement = crossed)
-            for crossed in body[anchor:index]
+    match plan:
+        case AliasCycle():
+            return OrderedAliases(
+                source = source,
+                warning = (
+                    f"type alias {plan.alias} needs {plan.name}, which cannot move above"
+                    " the aliases; the aliases keep their place"
+                ),
+            )
+        case _:
+            return OrderedAliases(
+                source = move_alias_block(source = source, body = body, block = plan),
+            )
+
+
+def plan_alias_block(
+    *,
+    body: list[ast.stmt],
+    target: PythonVersion | None,
+) -> AliasBlock | AliasCycle:
+    """The aliases that move up and the definitions that move above them. An alias blocks on
+    the statements it would move past, except the definitions that move up too; the aliases
+    and the definitions they need are found again until neither changes."""
+    anchor = count_leading_statements(body = body)
+    has_future_annotations = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in body
+    )
+
+    has_lazy_annotations = (
+        (target is not None and target >= LAZY_ANNOTATIONS_PYTHON)
+        or has_future_annotations
+    )
+
+    dependencies: list[ast.stmt] = []
+    while True:
+        aliases = [
+            statement
+            for index, statement in enumerate(body)
+            if isinstance(statement, ast.TypeAlias)
+            # a wildcard import can bind any name, so no alias moves past one
+            and not any(
+                {statement.name.id, "*"} & list_bound_or_used_names(statement = crossed)
+                for crossed in body[anchor:index]
+                if crossed not in dependencies
+            )
+        ]
+
+        found = find_alias_dependencies(
+            body = body,
+            anchor = anchor,
+            aliases = aliases,
+            has_lazy_annotations = has_lazy_annotations,
         )
+
+        match found:
+            case AliasCycle():
+                return found
+            case _ if found == dependencies:
+                return AliasBlock(dependencies = dependencies, aliases = aliases)
+            case _:
+                dependencies = found
+
+
+def find_alias_dependencies(
+    *,
+    body: list[ast.stmt],
+    anchor: int,
+    aliases: list[ast.TypeAlias],
+    has_lazy_annotations: bool,
+) -> list[ast.stmt] | AliasCycle:
+    """The definitions the alias values need, in written order, followed through what each
+    one evaluates when it runs. A needed name that is bound by the imports alone, or not at
+    module level, needs nothing. Any other name must be bound once, by a definition that no
+    wildcard import precedes, or it is a cycle. A definition of a name the module has before
+    it runs, a builtin or a dunder, never moves: a read above it would see the new value."""
+    bindings = Counter(
+        name
+        for statement in body
+        for name in list_module_bindings(statement = statement)
+    )
+
+    imported = {
+        name
+        for statement in body[:anchor]
+        for name in list_module_bindings(statement = statement)
+    }
+
+    definitions: dict[str, ast.stmt] = {}
+    for statement in body[anchor:]:
+        if "*" in list_module_bindings(statement = statement):
+            break
+
+        match read_definition_name(statement = statement):
+            case str() as name if (
+                bindings[name] == 1
+                and name not in vars(builtins)
+                and not (name.startswith("__") and name.endswith("__"))
+            ):
+                definitions[name] = statement
+            case _:
+                pass
+
+    # an alias the block holds needs no move, whatever other aliases its value names
+    alias_names = {
+        statement.name.id
+        for statement in body
+        if isinstance(statement, ast.TypeAlias)
+    }
+
+    pending = [
+        (alias.name.id, name)
+        for alias in aliases
+        for name in sorted(list_alias_value_names(value = alias.value) - alias_names)
     ]
 
-    if not aliases or body[anchor : anchor + len(aliases)] == aliases:
+    found: dict[str, ast.stmt] = {}
+    while pending:
+        alias, name = pending.pop()
+        is_satisfied = (
+            name in found
+            or not bindings[name]
+            or (name in imported and bindings[name] == 1)
+        )
+
+        if is_satisfied:
+            continue
+
+        if name not in definitions:
+            return AliasCycle(alias = alias, name = name)
+
+        found[name] = definitions[name]
+        pending.extend(
+            (alias, needed)
+            for needed in sorted(
+                list_evaluated_names(
+                    statement = definitions[name],
+                    has_lazy_annotations = has_lazy_annotations,
+                )
+            )
+        )
+
+    moved = set(map(id, found.values()))
+    return [statement for statement in body if id(statement) in moved]
+
+
+def list_alias_value_names(*, value: ast.expr) -> set[str]:
+    """The names an alias value uses as values: every name in a call, callee and arguments,
+    and every name in the metadata of an `Annotated`. Type positions do not count."""
+    expressions: list[ast.expr] = []
+    for node in ast.walk(value):
+        match node:
+            case ast.Call():
+                expressions.append(node)
+            case ast.Subscript(
+                value = ast.Name(id = "Annotated") | ast.Attribute(attr = "Annotated"),
+                slice = ast.Tuple(elts = [_, *metadata]),
+            ):
+                expressions.extend(metadata)
+            case _:
+                pass
+
+    return {
+        node.id
+        for expression in expressions
+        for node in ast.walk(expression)
+        if isinstance(node, ast.Name)
+    }
+
+
+def list_evaluated_names(
+    *,
+    statement: ast.stmt,
+    has_lazy_annotations: bool,
+) -> set[str]:
+    """The names a definition evaluates when it runs: a constant's value, a function's
+    decorators and defaults, a class's decorators, bases, keywords and body. Function bodies
+    never count; annotations count unless they are evaluated lazily. An assignment target
+    counts for the names it reads, such as the `REGISTRY` of `REGISTRY["key"] = value`."""
+    expressions: list[ast.AST] = []
+    nested: list[ast.stmt] = []
+
+    match statement:
+        case ast.Assign(targets = targets, value = value):
+            expressions.extend([*targets, value])
+        case ast.AnnAssign(target = target, annotation = annotation, value = value):
+            expressions.extend(
+                [
+                    target,
+                    *([value] if value else []),
+                    *([] if has_lazy_annotations else [annotation]),
+                ]
+            )
+        case ast.FunctionDef(args = arguments) | ast.AsyncFunctionDef(args = arguments):
+            expressions.extend(list_header_expressions(statement = statement))
+            parameters = [
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                *([arguments.vararg] if arguments.vararg else []),
+                *([arguments.kwarg] if arguments.kwarg else []),
+            ]
+
+            annotations = [
+                *(parameter.annotation for parameter in parameters),
+                statement.returns,
+            ]
+
+            if not has_lazy_annotations:
+                expressions.extend(
+                    annotation
+                    for annotation in annotations
+                    if annotation
+                )
+        case ast.ClassDef():
+            expressions.extend(list_header_expressions(statement = statement))
+            nested.extend(statement.body)
+        case _:
+            expressions.append(statement)
+
+    nodes = [
+        node
+        for expression in expressions
+        for node in walk_evaluated_nodes(node = expression)
+    ]
+
+    # `LIMIT += 1` reads LIMIT, though its target is stored
+    return (
+        {
+            node.id
+            for node in nodes
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        | {
+            node.target.id
+            for node in nodes
+            if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name)
+        }
+        | {
+            name
+            for member in nested
+            for name in list_evaluated_names(
+                statement = member,
+                has_lazy_annotations = has_lazy_annotations,
+            )
+        }
+    )
+
+
+def list_header_expressions(
+    *,
+    statement: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> list[ast.expr]:
+    """What a function or class evaluates where it is defined, except its annotations and a
+    class's body: decorators and defaults, or decorators, bases and keywords."""
+    match statement:
+        case ast.ClassDef():
+            return [
+                *statement.decorator_list,
+                *statement.bases,
+                *(keyword.value for keyword in statement.keywords),
+            ]
+        case _:
+            return [
+                *statement.decorator_list,
+                *statement.args.defaults,
+                *(default for default in statement.args.kw_defaults if default),
+            ]
+
+
+def walk_evaluated_nodes(*, node: ast.AST) -> Iterator[ast.AST]:
+    """Every node that runs when the node runs, as ast.walk gives them, except that a lambda's
+    body runs only when it is called: of a lambda, only the defaults count."""
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        yield current
+
+        match current:
+            case ast.Lambda(args = arguments):
+                pending.extend(
+                    [
+                        *arguments.defaults,
+                        *(default for default in arguments.kw_defaults if default),
+                    ]
+                )
+            case _:
+                pending.extend(ast.iter_child_nodes(current))
+
+
+def list_module_bindings(*, statement: ast.stmt) -> list[str]:
+    """The module-level names a top-level statement binds, once for each binding: a function
+    or class binds its name, a `global` in it and an assignment expression in its header
+    bind theirs; any other statement binds every name it stores, also in nested blocks. A
+    wildcard import binds `*`."""
+    match statement:
+        case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.ClassDef():
+            return [
+                statement.name,
+                *(
+                    name
+                    for node in ast.walk(statement)
+                    if isinstance(node, ast.Global)
+                    for name in node.names
+                ),
+                *(
+                    node.id
+                    for expression in list_header_expressions(statement = statement)
+                    for node in walk_evaluated_nodes(node = expression)
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                ),
+            ]
+        case _:
+            pass
+
+    names: list[str] = []
+    for node in ast.walk(statement):
+        match node:
+            case (
+                ast.Name(id = name, ctx = ast.Store())
+                | ast.FunctionDef(name = name)
+                | ast.AsyncFunctionDef(name = name)
+                | ast.ClassDef(name = name)
+                | ast.MatchAs(name = str() as name)
+                | ast.MatchStar(name = str() as name)
+                | ast.MatchMapping(rest = str() as name)
+                | ast.ExceptHandler(name = str() as name)
+            ):
+                names.append(name)
+            case ast.alias(name = name, asname = asname):
+                names.append(asname or name.split(".")[0])
+            case ast.Global(names = declared):
+                names.extend(declared)
+            case _:
+                pass
+
+    return names
+
+
+def read_definition_name(*, statement: ast.stmt) -> str | None:
+    """The name a movable definition binds: a function, a class, or a constant assigned to
+    one name. None for any other statement."""
+    match statement:
+        case (
+            ast.FunctionDef(name = name)
+            | ast.AsyncFunctionDef(name = name)
+            | ast.ClassDef(name = name)
+            | ast.Assign(targets = [ast.Name(id = name)])
+            | ast.AnnAssign(target = ast.Name(id = name), value = ast.expr())
+        ):
+            return name
+        case _:
+            return None
+
+
+def move_alias_block(*, source: str, body: list[ast.stmt], block: AliasBlock) -> str:
+    """The source with the dependencies and then the aliases right after the imports and the
+    logger. Each moves with the comments above it and the deeper comments that end it."""
+    anchor = count_leading_statements(body = body)
+    moved = [*block.dependencies, *block.aliases]
+
+    if not block.aliases or body[anchor : anchor + len(moved)] == moved:
         return source
 
     lines = io.StringIO(source).readlines()
@@ -173,21 +556,37 @@ def order_type_aliases(*, source: str) -> str:
         for previous, statement in zip([None, *body], body)
     }
 
-    alias_rows = [
-        range(
+    moved_rows = {
+        id(statement): range(
             find_member_start_row(
-                member = alias,
-                floor_row = floor_rows[id(alias)],
+                member = statement,
+                floor_row = floor_rows[id(statement)],
                 lines = lines,
             ),
-            find_last_row(node = alias) + 1,
+            find_body_end_row(member = statement, lines = lines) + 1,
         )
-        for alias in aliases
-    ]
-    alias_lines = [lines[row - 1] for rows in alias_rows for row in rows]
-    removed = {row for rows in alias_rows for row in rows}
+        for statement in moved
+    }
 
-    for rows in alias_rows:
+    # a blank line ends the dependencies; the spacing pass sets the gaps between them
+    dependency_lines = [
+        *(
+            lines[row - 1]
+            for statement in block.dependencies
+            for row in moved_rows[id(statement)]
+        ),
+        *(["\n"] if block.dependencies else []),
+    ]
+
+    alias_lines = [
+        lines[row - 1]
+        for alias in block.aliases
+        for row in moved_rows[id(alias)]
+    ]
+
+    removed = {row for rows in moved_rows.values() for row in rows}
+
+    for rows in moved_rows.values():
         row = rows[-1] + 1
         while row <= len(lines) and not lines[row - 1].strip():
             removed.add(row)
@@ -210,7 +609,9 @@ def order_type_aliases(*, source: str) -> str:
 
     # blank lines left behind at the end of the file, where the last alias stood, go too
     return (
-        "".join([*lines[:anchor_row], "\n", *alias_lines, "\n", *rest]).rstrip("\n")
+        "".join(
+            [*lines[:anchor_row], "\n", *dependency_lines, *alias_lines, "\n", *rest],
+        ).rstrip("\n")
         + "\n"
     )
 
