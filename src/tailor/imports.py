@@ -6,7 +6,9 @@ import itertools
 from enum import IntEnum
 from pathlib import Path
 
-from tailor.syntax import is_docstring, is_dunder_definition
+from tailor.sql import sql_signature
+from tailor.constants import SQL_MARKER
+from tailor.syntax import member_kind, is_docstring
 
 
 class ImportGroup(IntEnum):
@@ -207,18 +209,19 @@ def from_import_text(
     return f"{head} (\n" + "".join(f"{indent}{name},\n" for name in names) + ")"
 
 
-def same_meaning(*, before: str, after: str) -> bool:
+def same_meaning(*, before: str, after: str, sql_dialect: str) -> bool:
     """True when both sources have the same top-level imports, in any order, and the
     same other statements, in order. Positions are ignored."""
-    before_imports, before_rest = meaning(source = before)
-    after_imports, after_rest = meaning(source = after)
-    return (
-        before_imports == after_imports
-        and ast.dump(before_rest) == ast.dump(after_rest)
-    )
+    before_imports, before_rest = meaning(source = before, sql_dialect = sql_dialect)
+    after_imports, after_rest = meaning(source = after, sql_dialect = sql_dialect)
+    return before_imports == after_imports and ast.compare(before_rest, after_rest)
 
 
-def meaning(*, source: str) -> tuple[list[tuple[str, int, str, str]], ast.Module]:
+def meaning(
+    *,
+    source: str,
+    sql_dialect: str,
+) -> tuple[list[tuple[str, int, str, str]], ast.Module]:
     body = ast.parse(source).body
     imports = [
         statement
@@ -242,24 +245,61 @@ def meaning(*, source: str) -> tuple[list[tuple[str, int, str, str]], ast.Module
         type_ignores = [],
     )
 
-    # the order pass moves dunders inside a class, so their order does not count
+    # the order passes move type aliases and grouped class members; the string pass changes
+    # trailing whitespace in docstrings and the SQL layout, not its tokens; none of these count
+    rest.body = [
+        *(
+            statement
+            for statement in rest.body
+            if not isinstance(statement, ast.TypeAlias)
+        ),
+        # aliases of different names may trade places; two of one name keep their order
+        *sorted(
+            (
+                statement
+                for statement in rest.body
+                if isinstance(statement, ast.TypeAlias)
+            ),
+            key = lambda statement: statement.name.id,
+        ),
+    ]
+
     for node in ast.walk(rest):
         if isinstance(node, ast.ClassDef):
             node.body = [
                 *(
                     statement
                     for statement in node.body
-                    if not is_dunder_definition(statement = statement)
+                    if member_kind(member = statement) is None
                 ),
                 *sorted(
                     (
                         statement
                         for statement in node.body
-                        if is_dunder_definition(statement = statement)
+                        if member_kind(member = statement) is not None
                     ),
-                    key = lambda statement: statement.name,
+                    key = lambda statement: (
+                        member_kind(member = statement),
+                        statement.name,
+                    ),
                 ),
             ]
+
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and is_docstring(statement = body[0]):
+            body[0].value.value = body[0].value.value.rstrip()
+
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith(SQL_MARKER)
+        ):
+            node.value = repr(
+                sql_signature(
+                    sql = node.value.removeprefix(SQL_MARKER),
+                    dialect = sql_dialect,
+                )
+            )
 
     return imported, rest
 

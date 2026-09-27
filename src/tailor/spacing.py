@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from collections.abc import Iterator
 
 from tailor.config import Settings
-from tailor.constants import DEFINITIONS, LOOPS_AND_BRANCHES
+from tailor.constants import IMPORTS, DEFINITIONS, LOOPS_AND_BRANCHES
 from tailor.syntax import (
     first_row,
     leading_row,
@@ -164,6 +164,11 @@ def gap_edits(*, block: Block, lines: list[str], settings: Settings) -> list[Gap
         gap_rows = gap_rows,
         group_size = settings.assignment_group_size,
     )
+
+    first_definition = next(
+        (statement for statement in body if isinstance(statement, DEFINITIONS)),
+        None,
+    )
     edits = []
 
     for index, (previous, current) in enumerate(pairs):
@@ -190,6 +195,8 @@ def gap_edits(*, block: Block, lines: list[str], settings: Settings) -> list[Gap
                 lines = lines,
                 most_lines = settings.short_dunder_lines,
             ),
+            opens_methods = current is first_definition
+            and not isinstance(previous, DEFINITIONS),
             settings = settings,
         )
 
@@ -258,6 +265,7 @@ def wanted_blank_lines(
     assignment_break: bool,
     commented: bool,
     short_dunders: bool,
+    opens_methods: bool,
     settings: Settings,
 ) -> int:
     touches_definition = (
@@ -266,11 +274,21 @@ def wanted_blank_lines(
     )
 
     match block.context:
-        case Context.MODULE if touches_definition:
+        case Context.MODULE if touches_definition or (
+            isinstance(previous, IMPORTS)
+            and not isinstance(current, IMPORTS)
+        ):
             return settings.module_definition_blank_lines
         case Context.MODULE if assignment_break:
             return max(existing, 1)
-        case Context.CLASS if short_dunders:
+        # a method right after the docstring is opens_methods: it gets its one blank line below
+        case Context.CLASS if (
+            previous is block.body[0]
+            and is_docstring(statement = previous)
+            and not isinstance(current, DEFINITIONS)
+        ):
+            return 0
+        case Context.CLASS if short_dunders or opens_methods:
             return 1
         case Context.CLASS if touches_definition:
             return settings.class_definition_blank_lines

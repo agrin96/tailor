@@ -2,6 +2,8 @@
 
 import ast
 
+from tailor.constants import MemberKind, PROPERTY_DECORATORS
+
 
 def is_docstring(*, statement: ast.stmt) -> bool:
     return (
@@ -70,3 +72,33 @@ def body_end_row(*, member: ast.stmt, lines: list[str]) -> int:
         end_row = row
 
     return end_row
+
+
+def member_kind(*, member: ast.stmt) -> MemberKind | None:
+    """The group a class member moves with, or None when it keeps its place."""
+    if is_dunder_definition(statement = member):
+        return MemberKind.DUNDER
+
+    if not isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+        return None
+
+    names = {
+        decorator_name(decorator = decorator)
+        for decorator in member.decorator_list
+    }
+
+    if "classmethod" in names:
+        return MemberKind.CLASSMETHOD
+
+    if names & set(PROPERTY_DECORATORS):
+        return MemberKind.PROPERTY
+
+    return None
+
+
+def decorator_name(*, decorator: ast.expr) -> str | None:
+    """`classmethod` for @classmethod, `setter` for @name.setter; None for a call."""
+    match decorator:
+        case ast.Name(id = name) | ast.Attribute(attr = name):
+            return name
+    return None

@@ -8,22 +8,22 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Aleksandr Grin", email = "bytebrushsoftware@gmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 keywords = ["formatter", "ruff", "code style"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Quality Assurance",
 ]
 # tailor's output depends on how ruff lays code out, so stay within one ruff minor version
 dependencies = [
-    "click>=8.1",
     "ruff>=0.16.9,<0.17",
+    "sqruff>=0.40",
+    "syntaqlite>=0.10",
+    "typer>=0.12",
 ]
 
 [project.scripts]

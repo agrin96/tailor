@@ -1,7 +1,6 @@
 """Tokens and brackets: what every layout pass reads before it edits a line."""
 
 import io
-import sys
 import keyword
 import tokenize
 from dataclasses import field, dataclass
@@ -9,13 +8,8 @@ from dataclasses import field, dataclass
 from tailor.constants import BracketText, SoftKeyword
 
 
-# t-strings arrived in Python 3.14: before it, their tokens do not exist
-if sys.version_info >= (3, 14):
-    TEMPLATE_STARTS = (tokenize.FSTRING_START, tokenize.TSTRING_START)
-    TEMPLATE_ENDS = (tokenize.FSTRING_END, tokenize.TSTRING_END)
-else:
-    TEMPLATE_STARTS = (tokenize.FSTRING_START,)
-    TEMPLATE_ENDS = (tokenize.FSTRING_END,)
+TEMPLATE_STARTS = (tokenize.FSTRING_START, tokenize.TSTRING_START)
+TEMPLATE_ENDS = (tokenize.FSTRING_END, tokenize.TSTRING_END)
 
 TEMPLATE_DEPTH_CHANGE = (
     {start: 1 for start in TEMPLATE_STARTS}
@@ -28,7 +22,6 @@ VALUE_TYPES = (tokenize.NAME, tokenize.NUMBER, tokenize.STRING, *TEMPLATE_ENDS)
 class Bracket:
     """Children are the tokens directly inside: nested brackets show only their own
     opener and closer. The neighbor of a child is always a child, or the bracket itself."""
-
     before: tokenize.TokenInfo | None
     opener: tokenize.TokenInfo
     children: tuple[tokenize.TokenInfo, ...]
@@ -39,12 +32,10 @@ class Bracket:
 @dataclass(frozen = True)
 class OpenBracket:
     """A bracket whose closer is still ahead. Its children collect as the scan goes on."""
-
     before: tokenize.TokenInfo | None
     opener: tokenize.TokenInfo
     in_template: bool
     children: list[tokenize.TokenInfo] = field(default_factory = list)
-
 
     def close(self, *, closer: tokenize.TokenInfo) -> Bracket:
         return Bracket(

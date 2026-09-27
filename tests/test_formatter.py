@@ -1,23 +1,35 @@
+import ast
 import textwrap
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
+from typer.testing import CliRunner
 
 from tailor.imports import sort_imports
-from tailor.config import Settings, load_settings
 from tailor.operators import remove_split_markers
-from tailor import Mode, main, format_file, colored_diff, python_files, format_source
+from tailor.config import Settings, lower_bound, load_settings
+from tailor.dialects import sql_dialect, linter_dialect, declared_dialects
+from tailor import (
+    app,
+    Mode,
+    format_file,
+    colored_diff,
+    python_files,
+    format_source,
+    version_problems,
+)
+
 
 FIRST_PARTY = frozenset({"jobs", "worker"})
 
 
-def run(source: str, line_length: int = 88) -> str:
+def run(source: str, line_length: int = 88, sql_dialect: str = "sqlite") -> str:
     return format_source(
         source = textwrap.dedent(source),
         filename = "sample.py",
         first_party = FIRST_PARTY,
         settings = Settings(line_length = line_length),
+        sql_dialect = sql_dialect,
     )
 
 
@@ -398,7 +410,7 @@ def test_wrapped_conditional_expression_splits_before_if_and_else():
 
 def test_module_constants_split_into_groups_of_three_to_five():
     source = "import ast\n\nFIRST = 1\nSECOND = 2\nTHIRD = 3\nFOURTH = 4\nFIFTH = 5\nSIXTH = 6\nSEVENTH = 7\nprint(FIRST)\n"
-    expected = "import ast\n\nFIRST = 1\nSECOND = 2\nTHIRD = 3\nFOURTH = 4\n\nFIFTH = 5\nSIXTH = 6\nSEVENTH = 7\n\nprint(FIRST)\n"
+    expected = "import ast\n\n\nFIRST = 1\nSECOND = 2\nTHIRD = 3\nFOURTH = 4\n\nFIFTH = 5\nSIXTH = 6\nSEVENTH = 7\n\nprint(FIRST)\n"
     result = run(source)
 
     assert result == expected
@@ -426,7 +438,6 @@ def test_dunders_move_up_constructors_first_then_shortest_first():
     expected = """\
         class Node:
             kind: str
-
 
             def __init__(self, kind):
                 self.kind = kind
@@ -747,21 +758,392 @@ def test_colored_diff_colors_lines_by_their_prefix():
 def test_command_line_rejects_a_missing_path_and_check_with_diff(tmp_path, monkeypatch):
     (tmp_path / "module.py").write_text("value = 1\n")
     monkeypatch.chdir(tmp_path)
-    missing = CliRunner().invoke(main, ["missing.py"])
+    missing = CliRunner().invoke(app, ["missing.py"])
     assert missing.exit_code == 2 and "'missing.py' does not exist" in missing.output
-    both = CliRunner().invoke(main, ["--check", "--diff", "module.py"])
-    assert (
-        both.exit_code == 2
-        and "--check and --diff cannot be used together" in both.output
-    )
+    both = CliRunner().invoke(app, ["--check", "--diff", "module.py"])
+    assert both.exit_code == 2 and "cannot be used together with --diff" in both.output
 
 
 def test_redirected_diff_keeps_escape_characters_from_the_source(tmp_path, monkeypatch):
     (tmp_path / "module.py").write_text("value=1  # \x1b[31mred\x1b[0m\n")
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(main, ["--diff", "module.py"])
+    result = CliRunner().invoke(app, ["--diff", "module.py"])
     assert result.exit_code == 1
     assert (
         "-value=1  # \x1b[31mred\x1b[0m\n+value = 1  # \x1b[31mred\x1b[0m\n"
         in result.output
     )
+
+
+def test_projects_outside_the_supported_python_range_stop_the_run(tmp_path):
+    projects = {
+        "old": '[project]\nname = "old"\nrequires-python = ">=3.11"\n',
+        "new": '[project]\nname = "new"\nrequires-python = ">=3.99"\n',
+        "supported": '[project]\nname = "supported"\nrequires-python = ">=3.12,<4"\n',
+        "undeclared": "",
+        "ruff_target": '[tool.ruff]\ntarget-version = "py310"\n\n[project]\nrequires-python = ">=3.14"\n',
+    }
+    files = []
+    for name, pyproject in projects.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "pyproject.toml").write_text(pyproject)
+        (tmp_path / name / "module.py").write_text("value = call(first=1)\n")
+        files.append(tmp_path / name / "module.py")
+
+    problems = version_problems(files = files)
+    assert len(problems) == 3
+    assert "ruff_target/pyproject.toml targets Python 3.10" in problems[0]
+    assert (
+        "old/pyproject.toml targets Python 3.11; tailor formats code that targets Python 3.12"
+        in problems[1]
+    )
+
+    assert (
+        "new/pyproject.toml targets Python 3.99, but tailor runs on Python 3.14"
+        in problems[2]
+    )
+
+    result = CliRunner().invoke(app, [str(file) for file in files])
+    assert result.exit_code == 1
+    assert (
+        tmp_path
+        / "supported"
+        / "module.py"
+    ).read_text() == "value = call(first=1)\n"
+
+
+def test_class_layout_docstring_attributes_and_grouped_members():
+    source = """
+        class Settings:
+            \"\"\"The settings.
+
+            name: what it is called.
+            \"\"\"
+
+            name: str
+            def describe(self):
+                return self.name
+            @property
+            def label(self):
+                return self.name.title()
+            @label.setter
+            def label(self, value):
+                self.name = value
+            @classmethod
+            def load(cls):
+                return cls()
+    """
+
+    expected = """\
+        class Settings:
+            \"\"\"The settings.
+
+            name: what it is called.\"\"\"
+            name: str
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+
+            @property
+            def label(self):
+                return self.name.title()
+
+
+            @label.setter
+            def label(self, value):
+                self.name = value
+
+
+            def describe(self):
+                return self.name
+    """
+    result = run(source)
+    assert result == textwrap.dedent(expected)
+    assert run(result) == result
+
+
+def test_type_statements_move_after_the_logger():
+    source = """
+        import structlog
+
+        logger = structlog.get_logger("bonsai")
+        LIMIT = 3
+
+
+        def run():
+            return LIMIT
+
+
+        # a callback the runner calls
+        type Callback = Callable[[], None]
+        type Check = Callable[[int], bool]
+    """
+
+    expected = """\
+        import structlog
+
+
+        logger = structlog.get_logger("bonsai")
+
+        # a callback the runner calls
+        type Callback = Callable[[], None]
+        type Check = Callable[[int], bool]
+
+        LIMIT = 3
+
+
+        def run():
+            return LIMIT
+    """
+    result = run(source)
+    assert result == textwrap.dedent(expected)
+    assert run(result) == result
+
+
+def test_sql_strings_are_laid_out_by_syntaqlite_at_the_opening_quotes():
+    source = """
+        def allowance(db, user):
+            return db.fetch_one(
+                \"\"\"--sql
+            SELECT sessions, practiced_minutes FROM user_practice_stats WHERE user_id=? AND deleted_at IS NULL
+            \"\"\",
+                bindings=(user,),
+            )
+        def left(db, user):
+            return db.fetch_one(
+                \"\"\"--sql
+            SELECT @assists - (SELECT COUNT(*) FROM jobs WHERE json_extract(data, '$.user_id') = @user AND status NOT IN ('FAILED', 'CANCELLED')) AS assists_left
+            \"\"\",
+                bindings={"user": user},
+            )
+    """
+
+    expected = """\
+        def allowance(db, user):
+            return db.fetch_one(
+                \"\"\"--sql
+                SELECT sessions, practiced_minutes
+                FROM user_practice_stats
+                WHERE
+                  user_id = ?
+                  AND deleted_at IS NULL
+                \"\"\",
+                bindings = (user,),
+            )
+
+
+        def left(db, user):
+            return db.fetch_one(
+                \"\"\"--sql
+                SELECT
+                  @assists
+                  - (
+                    SELECT COUNT(*)
+                    FROM jobs
+                    WHERE
+                      json_extract(data, '$.user_id') = @user
+                      AND status NOT IN ('FAILED', 'CANCELLED')
+                  ) AS assists_left
+                \"\"\",
+                bindings = {"user": user},
+            )
+    """
+    result = run(source)
+    assert result == textwrap.dedent(expected)
+    assert run(result) == result
+
+
+def test_sql_with_a_value_across_lines_stays_as_written():
+    source = 'query = """--sql\nSELECT \'first\nsecond\' FROM t\n"""\n'
+    assert run(source) == source
+
+
+def test_postgres_sql_is_laid_out_by_sqruff():
+    source = 'rows = connection.fetch("""--sql\nselect u.id, u.email from users u where u.email ilike $1 order by u.created_at desc\n""")\n'
+    expected = """\
+rows = connection.fetch(\"\"\"--sql
+                        SELECT
+                          u.id,
+                          u.email
+                        FROM users u
+                        WHERE u.email ILIKE $1
+                        ORDER BY u.created_at DESC
+                        \"\"\")
+"""
+    result = run(source, sql_dialect = "postgres")
+
+    assert result == expected
+    assert run(result, sql_dialect = "postgres") == result
+
+
+def test_driver_placeholders_do_not_stop_the_layout():
+    source = 'rows = db.execute("""--sql\nselect a, b from users where id = %s and name = %(name)s and kind = \'%s\' group by a, b order by a\n""")\n'
+    expected = """\
+rows = db.execute(\"\"\"--sql
+                  SELECT
+                    a,
+                    b
+                  FROM users
+                  WHERE id = %s AND name = %(name)s AND kind = '%s'
+                  GROUP BY a, b
+                  ORDER BY a
+                  \"\"\")
+"""
+    assert run(source, sql_dialect = "postgres") == expected
+
+
+def test_sql_that_sqruff_parses_only_in_part_stays_as_written():
+    source = 'rows = db.execute("""--sql\nselect a from t where data::jsonb ? \'k\' is not null group by a order by a\n""")\n'
+    assert run(source, sql_dialect = "postgres") == source
+
+
+def detected(
+    tmp_path,
+    source: str,
+    settings: Settings = Settings(),
+) -> tuple[str, str | None]:
+    """Each call reads the files again: a run reads them once, this test changes them."""
+    linter_dialect.cache_clear()
+    declared_dialects.cache_clear()
+    path = tmp_path / "queries.py"
+    return sql_dialect(
+        path = path,
+        root = tmp_path,
+        tree = ast.parse(source),
+        settings = settings,
+    )
+
+
+def test_a_driver_import_sets_the_dialect(tmp_path):
+    assert detected(tmp_path, "import duckdb\n") == ("duckdb", None)
+    assert detected(tmp_path, "from google.cloud import bigquery\n") == (
+        "bigquery",
+        None,
+    )
+    assert detected(tmp_path, "import os\n") == ("sqlite", None)
+
+
+def test_the_dialect_is_found_in_order(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["psycopg[binary]>=3.1", "MySQL_Connector-Python"]\n',
+    )
+    dialect, warning = detected(tmp_path, "import os\n")
+    assert dialect == "sqlite" and "sql-dialect" in warning
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["psycopg2-binary"]\n',
+    )
+    assert detected(tmp_path, "import os\n") == ("postgres", None)
+    assert detected(tmp_path, "import duckdb\n") == ("duckdb", None)
+
+    (tmp_path / ".sqruff").write_text("[sqruff]\ndialect = snowflake\n")
+    assert detected(tmp_path, "import duckdb\n") == ("snowflake", None)
+    assert detected(tmp_path, "import duckdb\n", Settings(sql_dialect = "tsql")) == (
+        "tsql",
+        None,
+    )
+
+
+def test_an_unknown_sql_dialect_is_an_error(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.tailor]\nsql-dialect = "postgresql"\n',
+    )
+
+    with pytest.raises(ValueError, match = "sql-dialect must be one of"):
+        load_settings(root = tmp_path)
+
+
+def test_method_right_after_a_class_docstring_gets_one_blank_line():
+    source = 'class Slots:\n    """The slots."""\n    def __init__(self):\n        self.slots = {}\n'
+    expected = 'class Slots:\n    """The slots."""\n\n    def __init__(self):\n        self.slots = {}\n'
+    result = run(source)
+
+    assert result == expected
+    assert run(result) == result
+
+
+def test_the_nearest_ruff_configuration_sets_the_target(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nrequires-python = ">=3.14"\n')
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "legacy" / ".ruff.toml").write_text('target-version = "py311"\n')
+    (tmp_path / "legacy" / "module.py").write_text("value = 1\n")
+    (tmp_path / "module.py").write_text("value = 1\n")
+    problems = version_problems(
+        files = [tmp_path / "module.py", tmp_path / "legacy" / "module.py"],
+    )
+    assert len(problems) == 1 and "legacy/.ruff.toml targets Python 3.11" in problems[0]
+
+
+def test_requires_python_lower_bound_takes_every_clause():
+    assert lower_bound(requires = ">=3.10,>=3.12") == (3, 12)
+    assert lower_bound(requires = ">=3.12, <4") == (3, 12)
+    assert lower_bound(requires = ">3.10") == (3, 11)
+    assert lower_bound(requires = ">3.10.1") == (3, 10)
+    assert lower_bound(requires = "==3.13.*") == (3, 13)
+    assert lower_bound(requires = "<4") is None
+
+
+def test_type_statement_stays_when_its_name_is_used_before_it():
+    source = "import os\n\n\nAlias = int\ntype Alias = str\ntype Other = int\n"
+    expected = "import os\n\n\ntype Other = int\n\nAlias = int\ntype Alias = str\n"
+    result = run(source)
+
+    assert result == expected
+    assert run(result) == result
+
+
+def test_sql_marker_with_more_text_on_its_line_stays_a_comment():
+    source = 'script = """--sql DELETE FROM records;\nSELECT 1;\n"""\n'
+    assert run(source) == source
+
+
+def test_sql_values_joined_across_a_line_break_stay_as_written():
+    source = 'query = """--sql\nSELECT \'first\'\n\'second\';\n"""\n'
+    assert run(source) == source
+
+
+def test_an_extended_ruff_configuration_sets_the_target(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nrequires-python = ">=3.14"\n')
+    (tmp_path / "base.toml").write_text('target-version = "py311"\n')
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "legacy" / ".ruff.toml").write_text('extend = "../base.toml"\n')
+    (tmp_path / "legacy" / "module.py").write_text("value = call(first=1)\n")
+    problems = version_problems(files = [tmp_path / "legacy" / "module.py"])
+    assert len(problems) == 1 and "base.toml targets Python 3.11" in problems[0]
+
+
+def test_type_statement_stays_behind_a_match_capture_of_its_name():
+    source = "match 1:\n    case Alias:\n        pass\n\ntype Alias = str\n"
+    assert run(source) == source
+
+
+def test_type_statements_move_below_a_shebang():
+    source = "#!/usr/bin/env python3\nVALUE = 1\ntype Alias = int\nprint(VALUE)\n"
+    result = run(source)
+
+    assert result.startswith("#!/usr/bin/env python3\n\ntype Alias = int\n")
+    assert run(result) == result
+
+
+def test_type_statement_stays_behind_a_wildcard_import():
+    source = "VALUE = 1\nfrom types import *\n\n\ntype SimpleNamespace = str\n"
+    assert run(source) == source
+
+
+def test_sql_with_implicit_aliases_is_formatted():
+    source = 'rows = """--sql\nSELECT u.name n, p.title FROM users u JOIN posts p ON p.user_id = u.id WHERE u.active = 1 AND p.published = 1\n"""\n'
+    indent = " " * len("rows = ")
+
+    expected = (
+        'rows = """--sql\n'
+        f"{indent}SELECT u.name n, p.title\n"
+        f"{indent}FROM users u\n"
+        f"{indent}JOIN posts p ON p.user_id = u.id\n"
+        f"{indent}WHERE\n"
+        f"{indent}  u.active = 1\n"
+        f"{indent}  AND p.published = 1\n"
+        f'{indent}"""\n'
+    )
+    assert run(source) == expected

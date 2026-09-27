@@ -1,22 +1,35 @@
 import os
+import ast
 import sys
 import difflib
 import tokenize
 import subprocess
 from enum import StrEnum
 from pathlib import Path
+import importlib.metadata
+from typing import Annotated
 from dataclasses import replace, dataclass
 from concurrent.futures import ProcessPoolExecutor
 
-import click
+import typer
 
+from tailor.dialects import sql_dialect
+from tailor.sql import format_sql_strings
 from tailor.keywords import widen_keywords
 from tailor.spacing import space_statements
-from tailor.ordering import order_class_members
-from tailor.config import Settings, project_root, load_settings
+from tailor.strings import close_class_docstrings
+from tailor.ordering import order_type_aliases, order_class_members
 from tailor.imports import same_meaning, sort_imports, first_party_names
-from tailor.constants import Marker, DIFF_LINE_STYLES, MAXIMUM_RUFF_PASSES
+from tailor.config import Settings, project_root, load_settings, project_python
 from tailor.layout import ruff_binary, ruff_format, explode_brackets, restyle_brackets
+from tailor.constants import (
+    Marker,
+    SQL_MARKER,
+    DIFF_LINE_STYLES,
+    DEFAULT_SQL_DIALECT,
+    MAXIMUM_RUFF_PASSES,
+    MINIMUM_PROJECT_PYTHON,
+)
 
 
 class Mode(StrEnum):
@@ -31,6 +44,7 @@ class FileResult:
     changed: bool
     error: str | None
     diff: str
+    warning: str | None = None
 
 
 def format_source(
@@ -39,6 +53,7 @@ def format_source(
     filename: str,
     first_party: frozenset[str],
     settings: Settings,
+    sql_dialect: str,
 ) -> str:
     formatted = ruff_format(
         source = widen_keywords(source = source),
@@ -62,10 +77,27 @@ def format_source(
         source = sorted_imports,
         constructors = settings.constructors,
     )
-    result = space_statements(source = ordered, settings = settings)
+    aliased = order_type_aliases(source = ordered)
+    closed = close_class_docstrings(
+        source = aliased,
+        line_length = settings.line_length,
+    )
+
+    result = space_statements(
+        source = format_sql_strings(
+            source = closed,
+            line_length = settings.line_length,
+            dialect = sql_dialect,
+        ),
+        settings = settings,
+    )
 
     # ponytail: one check from ruff's output to the result, so a failure does not name the stage
-    if not same_meaning(before = formatted.replace(Marker.WIDENER, ""), after = result):
+    if not same_meaning(
+        before = formatted.replace(Marker.WIDENER, ""),
+        after = result,
+        sql_dialect = sql_dialect,
+    ):
         raise ValueError("house style changed what the code means, output discarded")
     return result
 
@@ -103,6 +135,18 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
         root = project_root(directory = path.resolve().parent)
         settings = load_settings(root = root)
 
+        # only a file with SQL needs its dialect, and only such a file can warn about it
+        dialect, warning = (
+            sql_dialect(
+                path = path,
+                root = root,
+                tree = ast.parse(source),
+                settings = settings,
+            )
+            if SQL_MARKER in source
+            else (DEFAULT_SQL_DIALECT, None)
+        )
+
         result = format_source(
             source = source,
             filename = str(path),
@@ -110,6 +154,7 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
             settings = replace(settings, line_length = line_length)
             if line_length
             else settings,
+            sql_dialect = dialect,
         )
     except subprocess.CalledProcessError as error:
         return FileResult(
@@ -130,7 +175,13 @@ def format_file(*, path: Path, mode: Mode, line_length: int | None) -> FileResul
         if changed and mode == Mode.DIFF
         else ""
     )
-    return FileResult(path = path, changed = changed, error = None, diff = diff)
+    return FileResult(
+        path = path,
+        changed = changed,
+        error = None,
+        diff = diff,
+        warning = warning,
+    )
 
 
 def colored_diff(*, diff: str) -> str:
@@ -151,7 +202,7 @@ def colored_line(*, line: str) -> str:
         return line
 
     text = line.rstrip("\n")
-    return click.style(text, **style) + line[len(text) :]
+    return typer.style(text, **style) + line[len(text) :]
 
 
 def unified_diff(*, before: str, after: str, name: str) -> str:
@@ -177,7 +228,7 @@ def format_files(
     if len(paths) == 1:
         return [format_file(path = paths[0], mode = mode, line_length = line_length)]
 
-    with ProcessPoolExecutor(max_workers = os.cpu_count()) as executor:
+    with ProcessPoolExecutor(max_workers = os.process_cpu_count()) as executor:
         # largest first, so one big file does not finish alone at the end
         futures = {
             path: executor.submit(
@@ -195,46 +246,77 @@ def format_files(
         return [futures[path].result() for path in paths]
 
 
-@click.command(help = "ruff format, then house style")
-@click.argument(
-    "paths",
-    nargs = -1,
-    required = True,
-    type = click.Path(exists = True, path_type = Path),
-)
-@click.option(
-    "--line-length",
-    type = click.IntRange(min = 1),
-    help = "Replaces line-length from [tool.tailor] or [tool.ruff] in pyproject.toml.",
-)
-@click.option(
-    "--check",
-    is_flag = True,
-    help = "List the files that would change, write nothing.",
-)
-@click.option(
-    "--diff",
-    is_flag = True,
-    help = "Show the changes as a diff, write nothing.",
-)
-@click.version_option(package_name = "pytailor")
-def main(
+app = typer.Typer(add_completion = False)
+
+
+def show_version(value: bool) -> None:
+    if value:
+        typer.echo(f"tailor {importlib.metadata.version('pytailor')}")
+        raise typer.Exit()
+
+
+@app.command(help = "ruff format, then house style.")
+def format_command(
     *,
-    paths: tuple[Path, ...],
-    line_length: int | None,
-    check: bool,
-    diff: bool,
+    paths: Annotated[
+        list[Path],
+        typer.Argument(
+            exists = True,
+            show_default = False,
+            help = "Files and folders to format.",
+        ),
+    ],
+    line_length: Annotated[
+        int | None,
+        typer.Option(
+            min = 1,
+            show_default = False,
+            help = "Replaces line-length from \\[tool.tailor] or \\[tool.ruff] in pyproject.toml.",
+        ),
+    ] = None,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help = "List the files that would change, write nothing.",
+        ),
+    ] = False,
+    diff: Annotated[
+        bool,
+        typer.Option("--diff", help = "Show the changes as a diff, write nothing."),
+    ] = False,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback = show_version,
+            is_eager = True,
+            help = "Show the version and exit.",
+        ),
+    ] = False,
 ) -> None:
     if check and diff:
-        raise click.UsageError("--check and --diff cannot be used together")
+        raise typer.BadParameter(
+            "cannot be used together with --diff",
+            param_hint = "--check",
+        )
 
     mode = Mode.DIFF if diff else Mode.CHECK if check else Mode.WRITE
     try:
-        files = python_files(paths = list(paths))
+        files = python_files(paths = paths)
     except subprocess.CalledProcessError as error:
-        raise click.ClickException(
-            f"ruff could not list the files: {error.stderr.strip()}",
+        typer.echo(
+            f"error: ruff could not list the files: {error.stderr.strip()}",
+            err = True,
         )
+        raise typer.Exit(code = 1)
+
+    # every project is checked before any file changes, so a run never stops half done
+    problems = version_problems(files = files)
+    if problems:
+        for problem in problems:
+            typer.echo(f"error: {problem}", err = True)
+        raise typer.Exit(code = 1)
 
     results = format_files(paths = files, mode = mode, line_length = line_length)
 
@@ -244,16 +326,70 @@ def main(
 
     for result in results:
         if result.error:
-            click.echo(f"error: {result.path}: {result.error}", err = True)
+            typer.echo(f"error: {result.path}: {result.error}", err = True)
         elif result.diff:
-            diff = colored_diff(diff = result.diff) if use_color else result.diff
-            click.echo(diff, nl = False, color = True)
+            diff_text = colored_diff(diff = result.diff) if use_color else result.diff
+            typer.echo(diff_text, nl = False, color = True)
         elif result.changed:
-            click.echo(
+            typer.echo(
                 f"{'reformatted' if mode == Mode.WRITE else 'would reformat'} {result.path}",
             )
+
+    # one project's warning comes from each of its files with SQL: show it once
+    for warning in dict.fromkeys(
+        result.warning
+        for result in results
+        if result.warning
+    ):
+        typer.echo(f"warning: {warning}", err = True)
 
     failed = any(result.error for result in results)
     changed = any(result.changed for result in results)
 
-    sys.exit(1 if failed or (mode != Mode.WRITE and changed) else 0)
+    raise typer.Exit(code = 1 if failed or (mode != Mode.WRITE and changed) else 0)
+
+
+def version_problems(*, files: list[Path]) -> list[str]:
+    """One message for each configuration whose target Python tailor cannot format: older
+    than MINIMUM_PROJECT_PYTHON, or newer than the Python tailor runs on."""
+    targets = set()
+    problems = []
+
+    for directory in sorted({file.resolve().parent for file in files}):
+        try:
+            target = project_python(directory = directory)
+        except ValueError as error:
+            problems.append(str(error))
+            continue
+
+        if target is not None:
+            targets.add(target)
+
+    return (
+        problems
+        + [
+            problem
+            for version, source in sorted(targets)
+            if (problem := version_problem(version = version, source = source))
+        ]
+    )
+
+
+def version_problem(*, version: tuple[int, int], source: Path) -> str | None:
+    running = sys.version_info[:2]
+    if MINIMUM_PROJECT_PYTHON <= version <= running:
+        return None
+
+    target = f"{version[0]}.{version[1]}"
+    if version < MINIMUM_PROJECT_PYTHON:
+        oldest = ".".join(map(str, MINIMUM_PROJECT_PYTHON))
+        return f"{source} targets Python {target}; tailor formats code that targets Python {oldest} or newer"
+
+    return (
+        f"{source} targets Python {target}, but tailor runs on Python {running[0]}.{running[1]}. "
+        f"Reinstall it on a newer Python: uv tool install --python {target} --reinstall pytailor"
+    )
+
+
+def main() -> None:
+    app()
