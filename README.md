@@ -192,7 +192,7 @@ row = db.fetch_one(
 )
 ```
 
-A clause that fits stays on one line. Keywords are upper case, and the SQL starts at the column of the opening quotes. tailor compares the SQL tokens before and after: if more than whitespace or case would change, or the SQL does not parse, the string stays as written.
+A clause that fits stays on one line. Keywords are upper case, and the SQL starts at the column of the opening quotes. SQLite SQL that ends with `;` keeps one `;` after each statement. tailor adds no `;` to other SQL, because that SQL can be part of a longer query. tailor compares the SQL tokens before and after: if more than whitespace or case would change, or the SQL does not parse, the string stays as written.
 
 tailor finds the dialect of each file in this order:
 

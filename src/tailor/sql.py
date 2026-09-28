@@ -113,7 +113,17 @@ def format_sql_strings(
 
 
 def lay_out_with_syntaqlite(*, sql: str, width: int, indent_width: int) -> str | None:
-    """The query laid out by syntaqlite, or None when syntaqlite cannot parse it."""
+    """The query laid out by syntaqlite, or None when syntaqlite cannot parse it. SQL that
+    ends with `;` keeps one after each statement; other SQL gets none, since it can be a
+    piece of a longer query. Comments after the last statement do not count."""
+    code_tokens = [
+        token
+        for token in load_sql_engine().tokenize(sql)
+        if not token["text"].isspace() and token["category"] != SqlTokenCategory.COMMENT
+    ]
+
+    ends_with_semicolon = bool(code_tokens) and code_tokens[-1]["text"] == ";"
+
     try:
         return (
             load_sql_engine()
@@ -122,7 +132,7 @@ def lay_out_with_syntaqlite(*, sql: str, width: int, indent_width: int) -> str |
                 line_width = width,
                 indent_width = indent_width,
                 keyword_case = "upper",
-                semicolons = False,
+                semicolons = ends_with_semicolon,
             )
             .strip()
         )

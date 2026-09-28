@@ -1286,6 +1286,45 @@ def test_sql_with_implicit_aliases_is_formatted():
     assert run(source) == expected
 
 
+def test_sql_that_ends_with_a_semicolon_keeps_one_after_each_statement():
+    source = """
+        def stop_user_jobs(db, user):
+            db.execute(
+                \"\"\"--sql
+                UPDATE jobs SET status = 'CANCELLED', finished = @now WHERE json_extract(data, '$.user_id') = @user AND status IN ('QUEUED', 'RUNNING');
+                DELETE FROM builder_states WHERE user_id = @user;
+                \"\"\",
+            )
+            return db.fetch_one(\"\"\"--sql
+                select id from jobs where id = @job
+                \"\"\")
+    """
+
+    expected = """\
+        def stop_user_jobs(db, user):
+            db.execute(
+                \"\"\"--sql
+                UPDATE jobs
+                SET
+                  status = 'CANCELLED',
+                  finished = @now
+                WHERE
+                  json_extract(data, '$.user_id') = @user
+                  AND status IN ('QUEUED', 'RUNNING');
+
+                DELETE FROM builder_states WHERE user_id = @user;
+                \"\"\"
+            )
+            return db.fetch_one(\"\"\"--sql
+                                SELECT id FROM jobs WHERE id = @job
+                                \"\"\")
+    """
+    result = run(source)
+
+    assert result == textwrap.dedent(expected)
+    assert run(result) == result
+
+
 # name: (source, the output); each output passes basedpyright, and a second run keeps it
 ALIAS_CASES = {
     "fastapi_dependencies": (
